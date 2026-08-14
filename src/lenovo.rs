@@ -68,6 +68,7 @@ use crate::{
 use crate::{JobState, RoleId};
 
 const UEFI_PASSWORD_NAME: &str = "UefiAdminPassword";
+const GENERAL_BOOT_ORDER_HARD_DISK: &str = "Hard Disk";
 
 pub struct Bmc {
     s: RedfishStandard,
@@ -1169,7 +1170,11 @@ impl Redfish for Bmc {
             // Check if the specific MAC address is first in the network boot order
             let mac = crate::resolve_boot_interface_mac(self, boot_interface).await?;
             let (expected, actual) = self.get_expected_and_actual_first_boot_option(&mac).await?;
-            Ok(expected.is_some() && expected == actual)
+            if expected.is_none() || expected != actual {
+                return Ok(false);
+            }
+
+            self.is_general_boot_order_hard_disk_present().await
         })
     }
 
@@ -1255,6 +1260,10 @@ impl Bmc {
         &self,
         mac_address: &str,
     ) -> Result<Option<String>, RedfishError> {
+        // Lenovo BMCs can drop Hard Disk from the general boot order, causing
+        // instance creation to fail because the tenant OS cannot boot.
+        self.enable_hard_disk_in_general_boot_order().await?;
+
         let mac = mac_address.to_string();
         // We see three patterns for HTTP IPv4 DPU boot option names in a Lenovo's network boot order:
         // "UEFI:   SLOT2 (31/0/0) HTTP IPv4  Nvidia Network Adapter - A0:88:C2:08:53:C4",
@@ -1935,6 +1944,45 @@ impl Bmc {
 
     fn get_boot_settings_uri(&self) -> String {
         format!("Systems/{}/Oem/Lenovo/BootSettings", self.s.system_id())
+    }
+
+    async fn get_general_boot_order(&self) -> Result<LenovoBootOrder, RedfishError> {
+        let url = format!("{}/BootOrder.BootOrder", self.get_boot_settings_uri());
+        self.s.client.get(&url).await.map(|response| response.1)
+    }
+
+    async fn is_general_boot_order_hard_disk_present(&self) -> Result<bool, RedfishError> {
+        match self.get_general_boot_order().await {
+            Ok(boot_order) => Ok(boot_order
+                .boot_order_next
+                .iter()
+                .any(|option| option == GENERAL_BOOT_ORDER_HARD_DISK)),
+            Err(RedfishError::HTTPErrorCode {
+                status_code: StatusCode::NOT_FOUND,
+                ..
+            }) => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn enable_hard_disk_in_general_boot_order(&self) -> Result<(), RedfishError> {
+        let mut boot_order = self.get_general_boot_order().await?;
+        if boot_order
+            .boot_order_next
+            .iter()
+            .any(|option| option == GENERAL_BOOT_ORDER_HARD_DISK)
+        {
+            return Ok(());
+        }
+
+        let insert_at = boot_order.boot_order_next.len().min(1);
+        boot_order
+            .boot_order_next
+            .insert(insert_at, GENERAL_BOOT_ORDER_HARD_DISK.to_string());
+
+        let url = format!("{}/BootOrder.BootOrder", self.get_boot_settings_uri());
+        let body = HashMap::from([("BootOrderNext", boot_order.boot_order_next)]);
+        self.s.client.patch(&url, body).await.map(|_status_code| ())
     }
 
     async fn get_network_boot_order(&self) -> Result<LenovoBootOrder, RedfishError> {
