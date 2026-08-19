@@ -1947,7 +1947,15 @@ impl Bmc {
     }
 
     async fn get_general_boot_order(&self) -> Result<LenovoBootOrder, RedfishError> {
-        let url = format!("{}/BootOrder.BootOrder", self.get_boot_settings_uri());
+        let boot_settings_uri = self.get_boot_settings_uri();
+        // Some Lenovo BMCs lazily initialize the child boot-order resources only
+        // after their parent collection has been read.
+        self.s
+            .client
+            .get::<BootSettings>(&boot_settings_uri)
+            .await?;
+
+        let url = format!("{boot_settings_uri}/BootOrder.BootOrder");
         self.s.client.get(&url).await.map(|response| response.1)
     }
 
@@ -2011,8 +2019,7 @@ impl Bmc {
     /// network boot order, because the network boot options list is empty
     /// when "Network" is not already present in the general boot order.
     async fn set_general_boot_order_network_first(&self) -> Result<(), RedfishError> {
-        let url = format!("{}/BootOrder.BootOrder", self.get_boot_settings_uri());
-        let (_status_code, mut boot_order): (_, LenovoBootOrder) = self.s.client.get(&url).await?;
+        let mut boot_order = self.get_general_boot_order().await?;
         const NETWORK: &str = "Network";
 
         if let Some(pos) = boot_order.boot_order_next.iter().position(|s| s == NETWORK) {
@@ -2025,6 +2032,7 @@ impl Bmc {
             boot_order.boot_order_next.insert(0, NETWORK.to_string());
         }
 
+        let url = format!("{}/BootOrder.BootOrder", self.get_boot_settings_uri());
         let body = HashMap::from([("BootOrderNext", boot_order.boot_order_next)]);
         self.s.client.patch(&url, body).await.map(|_status_code| ())
     }
