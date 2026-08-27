@@ -247,7 +247,7 @@ impl RedfishClientPool {
         // - P3809 is a placeholder — pick the GBx variant from chassis contents,
         //   whether it was auto-detected or explicitly provided.
         // - AMI is shared by Viking/DGX/GB300, distinguished by inspecting the
-        //   host systems (see `refine_ami_vendor`).
+        //   selected system and manager or the host systems.
         let vendor = match vendor {
             RedfishVendor::P3809 => {
                 if chassis.contains(&"MGX_NVSwitch_0".to_string()) {
@@ -263,10 +263,12 @@ impl RedfishClientPool {
         s.set_vendor(vendor).await
     }
 
-    /// Refine a service-root `AMI` vendor to `LenovoGB300` when the host is a
-    /// Lenovo system alongside an NVIDIA GB300 baseboard; other AMI platforms
-    /// (Viking/DGX, plain AMI) stay `AMI`.
+    /// Keep known Viking systems as AMI; otherwise detect Lenovo GB300.
     async fn refine_ami_vendor(s: &RedfishStandard) -> Result<RedfishVendor, RedfishError> {
+        if s.system_id() == "DGX" && s.manager_id() == "BMC" {
+            return Ok(RedfishVendor::AMI);
+        }
+
         let mut is_lenovo = false;
         let mut is_gb300 = false;
         for id in s.get_systems().await? {
