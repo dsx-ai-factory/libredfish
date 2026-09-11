@@ -666,11 +666,14 @@ impl RedfishHttpClient {
 
         let is_file = file.is_some();
 
-        // Create a span with explicitly NO parent to isolate HTTP operations.
-        // This prevents hyper-util's background tasks from capturing our caller's spans.
-        // See: hyper-util's TokioExecutor uses .in_current_span() when tracing feature is enabled,
-        // which causes span "bouncing" between tasks and delayed span closure.
-        let isolated_span = tracing::trace_span!(parent: None, "http_isolated");
+        // This span must be enabled by the usual INFO filter: a disabled span
+        // does not replace the current one, allowing hyper-util's TokioExecutor
+        // to capture the caller when it spawns a pooled connection driver.
+        let isolated_span = tracing::info_span!(
+            parent: None,
+            "http_isolated",
+            logfmt.suppress = true,
+        );
 
         async {
             match self
