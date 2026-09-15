@@ -5,7 +5,7 @@ authors = [
   "NVIDIA Engineering <noemail@nvidia.com>",
   "Chris Holcombe <xfactor973@gmail.com>",
 ]
-repository = "https://github.com/NVIDIA/libredfish"
+repository = "https://github.com/dsx-ai-factory/libredfish"
 license = "MIT"
 # Version is managed via git tags, see GitHub Releases
 version = "0.0.0"
