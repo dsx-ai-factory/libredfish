@@ -42,6 +42,10 @@ impl Bmc {
 }
 
 impl Redfish for Bmc {
+    fn std_redfish(&self) -> &RedfishStandard {
+        &self.s
+    }
+
     fn change_username<'a>(
         &'a self,
         old_name: &'a str,
@@ -208,11 +212,21 @@ impl Redfish for Bmc {
     }
 
     /// AMI BMC only supports ForceRestart
-    fn bmc_reset<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
+    fn bmc_reset<'a>(
+        &'a self,
+        reset_type: Option<ManagerResetType>,
+    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
-            self.s
-                .reset_manager(ManagerResetType::ForceRestart, None)
-                .await
+            match reset_type {
+                None | Some(ManagerResetType::ForceRestart) => {
+                    self.s
+                        .reset_manager(ManagerResetType::ForceRestart, None)
+                        .await
+                }
+                Some(other) => Err(RedfishError::NotSupported(format!(
+                    "AMI BMC only supports ForceRestart for Manager.Reset, but {other} was requested"
+                ))),
+            }
         })
     }
 
