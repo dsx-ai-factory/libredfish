@@ -98,7 +98,7 @@ pub enum RedfishError {
     MissingVendor,
 
     #[error("Password change required")]
-    PasswordChangeRequired,
+    PasswordChangeRequired { account_uri: Option<String> },
 
     #[error("Maximum amount of user accounts reached. Delete one to continue.")]
     TooManyUsers,

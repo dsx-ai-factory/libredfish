@@ -52,6 +52,12 @@ pub struct System {
     pub boot_settings: Option<ODataId>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct Port {
+    pub physical_port_mac_address: Option<String>,
+}
+
 /* Front Panel USB Port Management mapping from UI to redfish API:
 
  - UI: Host Only Mode

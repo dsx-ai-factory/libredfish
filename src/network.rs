@@ -26,7 +26,8 @@ use regex::Regex;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, IF_MATCH},
     multipart::{Form, Part},
-    Client as HttpClient, ClientBuilder as HttpClientBuilder, Method, Proxy, StatusCode,
+    Certificate, Client as HttpClient, ClientBuilder as HttpClientBuilder, Identity, Method, Proxy,
+    StatusCode,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::{debug, Instrument};
@@ -43,12 +44,33 @@ const MIN_UPLOAD_BANDWIDTH: u64 = 10_000;
 // is still starting up), so retry a few times before giving up.
 const FORBIDDEN_RETRY_DELAY: Duration = Duration::from_secs(8);
 
-#[derive(Debug)]
 pub struct RedfishClientPoolBuilder {
     connect_timeout: Duration,
     timeout: Duration,
     accept_invalid_certs: bool,
     proxy: Option<String>,
+    identity: Option<ClientIdentityPem>,
+    root_certificates: Vec<Vec<u8>>,
+}
+
+/// A PEM encoded client certificate chain and its private key.
+#[derive(Clone)]
+struct ClientIdentityPem {
+    cert: Vec<u8>,
+    key: Vec<u8>,
+}
+
+impl std::fmt::Debug for RedfishClientPoolBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedfishClientPoolBuilder")
+            .field("connect_timeout", &self.connect_timeout)
+            .field("timeout", &self.timeout)
+            .field("accept_invalid_certs", &self.accept_invalid_certs)
+            .field("proxy", &self.proxy)
+            .field("identity", &self.identity.as_ref().map(|_| "[REDACTED]"))
+            .field("root_certificates", &self.root_certificates.len())
+            .finish()
+    }
 }
 
 impl RedfishClientPoolBuilder {
@@ -79,12 +101,60 @@ impl RedfishClientPoolBuilder {
         self
     }
 
+    /// Presents a client certificate during the TLS handshake.
+    ///
+    /// Redfish endpoints themselves do not ask for one, but an authenticating
+    /// proxy in front of them identifies its callers this way, so a pool aimed
+    /// at such a proxy needs an identity.
+    ///
+    /// `cert_pem` is the PEM encoded certificate chain and `key_pem` its PEM
+    /// encoded private key, in RSA, SEC1 elliptic curve, or PKCS#8 format.
+    /// They are commonly two separate files (`tls.crt` and `tls.key`) and are
+    /// accepted separately here so the caller does not have to join them.
+    ///
+    /// The PEM is not parsed until [`Self::build`], which reports a malformed
+    /// certificate or key.
+    pub fn identity(mut self, cert_pem: impl Into<Vec<u8>>, key_pem: impl Into<Vec<u8>>) -> Self {
+        self.identity = Some(ClientIdentityPem {
+            cert: cert_pem.into(),
+            key: key_pem.into(),
+        });
+        self
+    }
+
+    /// Trusts the certificates in a PEM bundle for server verification, in
+    /// addition to the roots the platform already trusts.
+    ///
+    /// May be called more than once; each bundle adds to the trusted set. The
+    /// bundle is not parsed until [`Self::build`].
+    pub fn add_root_certificates(mut self, pem_bundle: impl Into<Vec<u8>>) -> Self {
+        self.root_certificates.push(pem_bundle.into());
+        self
+    }
+
     /// Builds a Redfish Client Network Configuration
     pub fn build(&self) -> Result<RedfishClientPool, RedfishError> {
         let mut builder = HttpClientBuilder::new();
         if let Some(proxy) = self.proxy.as_ref() {
             let p = Proxy::https(proxy)?;
             builder = builder.proxy(p);
+        }
+
+        if let Some(identity) = self.identity.as_ref() {
+            builder = builder.identity(identity.to_reqwest_identity()?);
+        }
+
+        for pem_bundle in &self.root_certificates {
+            // A bundle legitimately holds more than one certificate, and
+            // reqwest takes them one at a time.
+            let certificates = Certificate::from_pem_bundle(pem_bundle).map_err(|e| {
+                RedfishError::GenericError {
+                    error: format!("Failed to parse root certificate bundle: {}", e),
+                }
+            })?;
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
         }
 
         let http_client = builder
@@ -98,6 +168,21 @@ impl RedfishClientPoolBuilder {
         let pool = RedfishClientPool { http_client };
 
         Ok(pool)
+    }
+}
+
+impl ClientIdentityPem {
+    fn to_reqwest_identity(&self) -> Result<Identity, RedfishError> {
+        let mut pem = Vec::with_capacity(self.key.len() + self.cert.len() + 1);
+        pem.extend_from_slice(&self.key);
+        if !self.key.ends_with(b"\n") {
+            pem.push(b'\n');
+        }
+        pem.extend_from_slice(&self.cert);
+
+        Identity::from_pem(&pem).map_err(|e| RedfishError::GenericError {
+            error: format!("Failed to parse client identity: {}", e),
+        })
     }
 }
 
@@ -139,6 +224,8 @@ impl RedfishClientPool {
             // BMCs often have a self-signed cert, so usually this has to be true
             accept_invalid_certs: false,
             proxy: None,
+            identity: None,
+            root_certificates: Vec::new(),
         }
     }
 
@@ -214,9 +301,12 @@ impl RedfishClientPool {
         };
 
         let managers = s.get_managers().await?;
-        let manager_id = managers.first().ok_or_else(|| RedfishError::GenericError {
-            error: "No managers found in service root".to_string(),
-        })?;
+        let mut manager_id = managers
+            .first()
+            .ok_or_else(|| RedfishError::GenericError {
+                error: "No managers found in service root".to_string(),
+            })?
+            .clone();
         let chassis = s.get_chassis_all().await?;
 
         // Delta power shelves expose no `/Systems` resource (a real query 404s)
@@ -231,18 +321,48 @@ impl RedfishClientPool {
             // member blindly targets the wrong system (no BIOS/boot). Falling
             // back to the first member preserves behavior for every platform
             // that does not expose `System_0` (e.g. Viking's `DGX`).
-            let system_id = systems
+            let preferred_system_id = systems
                 .iter()
                 .find(|id| *id == "System_0")
                 .or_else(|| systems.first())
                 .ok_or_else(|| RedfishError::GenericError {
                     error: "No systems found in service root".to_string(),
                 })?;
+
+            // Prefer a system that exposes a Bios resource, but probe the
+            // preferred host id first. Auxiliary systems such as
+            // `HGX_Baseboard_0` are often enumerated ahead of `System_0` and
+            // also advertise a Bios link, so scanning Members order alone
+            // selects the GPU baseboard (no host SecureBoot / BootOrder) and
+            // discards the System_0 preference above. Treat fetch errors as
+            // "no BIOS here": we already have `preferred_system_id` as a
+            // fallback, and this also handles the test mockup, which drops
+            // the connection instead of returning 404 when Bios is empty.
+            let mut system_with_bios: Option<ComputerSystem> = None;
+            for system_member in system_ids_for_bios_probe(preferred_system_id, &systems) {
+                system_with_bios = s.if_system_has_bios(system_member).await;
+                if system_with_bios.is_some() {
+                    break;
+                }
+            }
+            let manager_from_system = system_with_bios
+                .as_ref()
+                .and_then(|swb| swb.links.as_ref())
+                .and_then(|links| links.managed_by.as_ref())
+                .and_then(|mb| mb.first())
+                .and_then(|d| d.odata_id.trim_matches('/').split('/').next_back())
+                .map(|m| m.to_string());
+            manager_id = manager_from_system.unwrap_or(manager_id);
+
+            let system_id = system_with_bios
+                .map(|swb| swb.id.to_owned())
+                .unwrap_or(preferred_system_id.to_owned());
+
             // call set_system_id always before calling set_vendor
-            s.set_system_id(system_id)?;
+            s.set_system_id(&system_id)?;
         }
 
-        s.set_manager_id(manager_id)?;
+        s.set_manager_id(&manager_id)?;
         s.set_service_root(service_root.clone())?;
 
         // Resolve placeholder/ambiguous vendors that can only be settled from
@@ -250,7 +370,7 @@ impl RedfishClientPool {
         // - P3809 is a placeholder — pick the GBx variant from chassis contents,
         //   whether it was auto-detected or explicitly provided.
         // - AMI is shared by Viking/DGX/GB300, distinguished by inspecting the
-        //   host systems (see `refine_ami_vendor`).
+        //   selected system and manager or the host systems.
         let vendor = match vendor {
             RedfishVendor::P3809 => {
                 if chassis.contains(&"MGX_NVSwitch_0".to_string()) {
@@ -266,10 +386,12 @@ impl RedfishClientPool {
         s.set_vendor(vendor).await
     }
 
-    /// Refine a service-root `AMI` vendor to `LenovoGB300` when the host is a
-    /// Lenovo system alongside an NVIDIA GB300 baseboard; other AMI platforms
-    /// (Viking/DGX, plain AMI) stay `AMI`.
+    /// Keep known Viking systems as AMI; otherwise detect Lenovo GB300.
     async fn refine_ami_vendor(s: &RedfishStandard) -> Result<RedfishVendor, RedfishError> {
+        if s.system_id() == "DGX" && s.manager_id() == "BMC" {
+            return Ok(RedfishVendor::AMI);
+        }
+
         let mut is_lenovo = false;
         let mut is_gb300 = false;
         for id in s.get_systems().await? {
@@ -321,6 +443,32 @@ impl RedfishClientPool {
     }
 }
 
+/// Applies `custom_headers` to a request, failing on a value that is not a
+/// valid HTTP header value.
+fn apply_custom_headers(
+    mut req_b: reqwest::RequestBuilder,
+    custom_headers: &[(HeaderName, String)],
+    url: &str,
+) -> Result<reqwest::RequestBuilder, RedfishError> {
+    for (key, val) in custom_headers.iter() {
+        let value = match HeaderValue::from_str(val) {
+            Ok(x) => x,
+            Err(e) => {
+                return Err(RedfishError::InvalidValue {
+                    url: url.to_string(),
+                    field: "0".to_string(),
+                    err: InvalidValueError(format!(
+                        "Invalid custom header {} value: {}, error: {}",
+                        key, val, e
+                    )),
+                });
+            }
+        };
+        req_b = req_b.header(key, value);
+    }
+    Ok(req_b)
+}
+
 /// A HTTP client which targets a single libredfish endpoint
 #[derive(Clone)]
 pub struct RedfishHttpClient {
@@ -350,6 +498,16 @@ impl RedfishHttpClient {
     /// Returns `true` if this client has no credentials (i.e. anonymous/unauthenticated).
     pub fn is_anonymous(&self) -> bool {
         self.endpoint.user.is_none()
+    }
+
+    pub(crate) async fn get_anonymous<T>(&self, api: &str) -> Result<(StatusCode, T), RedfishError>
+    where
+        T: DeserializeOwned + ::std::fmt::Debug,
+    {
+        let mut client = self.clone();
+        client.endpoint.user = None;
+        client.endpoint.password = None;
+        client.get(api).await
     }
 
     pub async fn get<T>(&self, api: &str) -> Result<(StatusCode, T), RedfishError>
@@ -624,22 +782,7 @@ impl RedfishHttpClient {
             req_b = req_b.header(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         }
 
-        for (key, val) in custom_headers.iter() {
-            let value = match HeaderValue::from_str(val) {
-                Ok(x) => x,
-                Err(e) => {
-                    return Err(RedfishError::InvalidValue {
-                        url: url.to_string(),
-                        field: "0".to_string(),
-                        err: InvalidValueError(format!(
-                            "Invalid custom header {} value: {}, error: {}",
-                            key, val, e
-                        )),
-                    });
-                }
-            };
-            req_b = req_b.header(key, value);
-        }
+        req_b = apply_custom_headers(req_b, custom_headers, &url)?;
 
         if let Some(user) = &self.endpoint.user {
             req_b = req_b.basic_auth(user, self.endpoint.password.as_ref());
@@ -689,16 +832,18 @@ impl RedfishHttpClient {
                 // If PasswordChangeRequired is in the response, return a PasswordChangeRequired error.
                 if let Ok(err) = serde_json::from_str::<crate::model::error::Error>(&response_body)
                 {
-                    if err
+                    if let Some(password_change_required) = err
                         .error
                         .extended
                         .iter()
                         // TODO(ajf) The actual message ID is specified in DTMF RedFish 9.5.11.2 so we
                         // should properly parse it into a type since the error may come from different
                         // MessageRegistries
-                        .any(|ext| ext.message_id.ends_with("PasswordChangeRequired"))
+                        .find(|ext| ext.message_id.ends_with("PasswordChangeRequired"))
                     {
-                        return Err(RedfishError::PasswordChangeRequired);
+                        return Err(RedfishError::PasswordChangeRequired {
+                            account_uri: password_change_required.message_args.first().cloned(),
+                        });
                     }
                 }
                 // If we can't decode the error JSON, just return the normal HTTPErrorCode. Some
@@ -839,11 +984,12 @@ impl RedfishHttpClient {
             );
         }
 
-        let response = self
+        let req_b = self
             .http_client
             .post(url.clone())
             .timeout(timeout)
-            .multipart(form)
+            .multipart(form);
+        let response = apply_custom_headers(req_b, &self.custom_headers, &url)?
             .basic_auth(user, self.endpoint.password.as_ref())
             .send()
             .await
@@ -884,6 +1030,20 @@ impl RedfishHttpClient {
 
         Ok((status_code, loc, response_body))
     }
+}
+
+/// Order system ids for the Bios probe: preferred host first, then the remaining
+/// members in enumeration order (skipping the preferred id so it is not probed twice).
+fn system_ids_for_bios_probe<'a>(
+    preferred: &'a str,
+    systems: &'a [String],
+) -> impl Iterator<Item = &'a str> {
+    std::iter::once(preferred).chain(
+        systems
+            .iter()
+            .map(String::as_str)
+            .filter(move |id| *id != preferred),
+    )
 }
 
 fn truncate(s: &str, len: usize) -> &str {
@@ -1079,6 +1239,146 @@ mod tests {
         assert!(
             !logged.contains("supersecret"),
             "no part of the secret must appear after truncation"
+        );
+    }
+
+    #[test]
+    fn bios_probe_order_prefers_system_0_ahead_of_hgx_baseboard() {
+        let systems = vec!["HGX_Baseboard_0".to_string(), "System_0".to_string()];
+        let order: Vec<&str> = system_ids_for_bios_probe("System_0", &systems).collect();
+        assert_eq!(order, vec!["System_0", "HGX_Baseboard_0"]);
+    }
+
+    #[test]
+    fn bios_probe_order_keeps_preferred_first_when_already_first() {
+        let systems = vec!["System_0".to_string(), "HGX_Baseboard_0".to_string()];
+        let order: Vec<&str> = system_ids_for_bios_probe("System_0", &systems).collect();
+        assert_eq!(order, vec!["System_0", "HGX_Baseboard_0"]);
+    }
+
+    #[test]
+    fn bios_probe_order_falls_back_to_first_member_when_no_system_0() {
+        let systems = vec!["DGX".to_string(), "HGX_Baseboard_0".to_string()];
+        let preferred = systems.first().map(String::as_str).unwrap();
+        let order: Vec<&str> = system_ids_for_bios_probe(preferred, &systems).collect();
+        assert_eq!(order, vec!["DGX", "HGX_Baseboard_0"]);
+    }
+
+    const TEST_CERT_PEM: &[u8] = include_bytes!("../tests/cert.pem");
+    const TEST_KEY_PEM: &[u8] = include_bytes!("../tests/key.pem");
+
+    #[test]
+    fn custom_headers_are_applied_and_invalid_values_rejected() {
+        let client = HttpClient::new();
+        let headers = vec![(
+            HeaderName::from_static("forwarded"),
+            "host=192.0.2.10".to_string(),
+        )];
+
+        let request = apply_custom_headers(
+            client.post("https://bmc.invalid/redfish/v1/UpdateService"),
+            &headers,
+            "https://bmc.invalid/redfish/v1/UpdateService",
+        )
+        .expect("valid header value applies")
+        .build()
+        .expect("request builds");
+        assert_eq!(
+            request.headers().get("forwarded").unwrap(),
+            "host=192.0.2.10"
+        );
+
+        let invalid = vec![(
+            HeaderName::from_static("forwarded"),
+            "host=bad\nvalue".to_string(),
+        )];
+        let err = apply_custom_headers(
+            client.post("https://bmc.invalid/x"),
+            &invalid,
+            "https://bmc.invalid/x",
+        )
+        .expect_err("a header value with a control character must be rejected");
+        assert!(
+            err.to_string().contains("Invalid custom header"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn builds_with_a_client_identity() {
+        RedfishClientPool::builder()
+            .identity(TEST_CERT_PEM, TEST_KEY_PEM)
+            .build()
+            .expect("a matching certificate and key should build a client identity");
+    }
+
+    // The two files are supplied separately and joined internally, so a cert
+    // that does not end in a newline must not run into the key's PEM header.
+    #[test]
+    fn builds_with_a_client_identity_lacking_a_trailing_newline() {
+        let mut key = TEST_KEY_PEM.to_vec();
+        while key.last() == Some(&b'\n') {
+            key.pop();
+        }
+
+        RedfishClientPool::builder()
+            .identity(TEST_CERT_PEM, key)
+            .build()
+            .expect("a key without a trailing newline should still build");
+    }
+
+    #[test]
+    fn rejects_a_malformed_client_identity() {
+        let err = RedfishClientPool::builder()
+            .identity(b"not a certificate".to_vec(), b"not a key".to_vec())
+            .build()
+            .expect_err("malformed PEM should fail the build");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("Failed to parse client identity"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains("not a key"),
+            "the error must not quote the key material: {message}"
+        );
+    }
+
+    #[test]
+    fn builds_with_added_root_certificates() {
+        RedfishClientPool::builder()
+            .add_root_certificates(TEST_CERT_PEM)
+            .build()
+            .expect("a PEM certificate should be accepted as a root");
+    }
+
+    #[test]
+    fn rejects_a_malformed_root_certificate_bundle() {
+        let err = RedfishClientPool::builder()
+            .add_root_certificates(b"-----BEGIN CERTIFICATE-----\nnope\n".to_vec())
+            .build()
+            .expect_err("malformed PEM should fail the build");
+
+        assert!(
+            err.to_string()
+                .contains("Failed to parse root certificate bundle"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // The builder carries a private key, so its Debug must not print it.
+    #[test]
+    fn debug_redacts_the_client_identity() {
+        let rendered = format!(
+            "{:?}",
+            RedfishClientPool::builder().identity(TEST_CERT_PEM, TEST_KEY_PEM)
+        );
+
+        assert!(rendered.contains("[REDACTED]"), "unexpected: {rendered}");
+        assert!(
+            !rendered.contains("PRIVATE KEY"),
+            "the key must not be rendered: {rendered}"
         );
     }
 }

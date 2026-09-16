@@ -70,11 +70,14 @@ pub struct Fan {
     pub thresholds: Option<FanThresholds>,
 }
 
+/// One `TemperatureReadingsCelsius` entry on NVIDIA OpenBMC host BMCs.
+/// GB200 includes `@odata.id`; Vera Rubin may omit it and only provide `DataSourceUri`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct TemperatureOemNvidia {
-    #[serde(rename = "@odata.id")]
-    pub odata_id: String,
+    #[serde(rename = "@odata.id", default)]
+    pub odata_id: Option<String>,
+    pub data_source_uri: Option<String>,
     pub device_name: Option<String>,
     pub physical_context: Option<String>,
     pub reading: Option<f64>,
@@ -137,13 +140,24 @@ impl Default for Temperature {
 
 impl From<TemperatureOemNvidia> for Temperature {
     fn from(temp: TemperatureOemNvidia) -> Self {
+        let name = temp
+            .device_name
+            .or_else(|| sensor_name_from_uri(temp.data_source_uri.as_deref()))
+            .or_else(|| sensor_name_from_uri(temp.odata_id.as_deref()))
+            .unwrap_or_else(|| "Unknown".to_string());
         Self {
-            name: temp.device_name.unwrap_or("Unknown".to_string()),
+            name,
             reading_celsius: temp.reading,
             physical_context: temp.physical_context,
             ..Default::default()
         }
     }
+}
+
+fn sensor_name_from_uri(uri: Option<&str>) -> Option<String> {
+    uri.and_then(|uri| uri.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 impl From<Sensor> for Temperature {
@@ -300,6 +314,41 @@ impl StatusVec for Thermal {
 
 #[cfg(test)]
 mod test {
+    use super::{Temperature, TemperatureOemNvidia, TemperaturesOemNvidia};
+
+    #[test]
+    fn test_temperature_oem_nvidia_vera_rubin_without_odata_id() {
+        let body = include_str!("testdata/thermal-nvidia-vr-thermalmetrics.json");
+        let metrics: TemperaturesOemNvidia = serde_json::from_str(body).unwrap();
+        let readings = metrics.temperature_readings_celsius.unwrap();
+        assert_eq!(readings.len(), 1);
+        assert!(readings[0].odata_id.is_none());
+        assert_eq!(
+            readings[0].data_source_uri.as_deref(),
+            Some("/redfish/v1/Chassis/BMC_0/Sensors/BMC_0_Temp_0")
+        );
+
+        let temp: Temperature = readings[0].clone().into();
+        assert_eq!(temp.name, "BMC_0_Temp_0");
+        assert_eq!(temp.reading_celsius, Some(56.062));
+    }
+
+    #[test]
+    fn test_temperature_oem_nvidia_gb200_with_odata_id() {
+        let reading: TemperatureOemNvidia = serde_json::from_str(
+            r#"{
+                "@odata.id": "/redfish/v1/Chassis/BMC_0/Sensors/BMC_0_DCSCM_Temp_0",
+                "DataSourceUri": "/redfish/v1/Chassis/BMC_0/Sensors/BMC_0_DCSCM_Temp_0",
+                "DeviceName": "BMC_0_DCSCM_Temp_0",
+                "Reading": 33.875
+            }"#,
+        )
+        .unwrap();
+        let temp: Temperature = reading.into();
+        assert_eq!(temp.name, "BMC_0_DCSCM_Temp_0");
+        assert_eq!(temp.reading_celsius, Some(33.875));
+    }
+
     #[test]
     fn test_thermal_parser() {
         // TODO: hpe test data is obsolete, needs to be updated from latest iLO BMC

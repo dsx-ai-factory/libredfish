@@ -68,12 +68,14 @@ pub enum RedfishVendor {
     Supermicro,
     AMI, // Viking DGX H100
     Hpe,
-    NvidiaGH200,    // grace-hopper 200
+    NvidiaGH200, // grace-hopper 200
     NvidiaGBx00, // all Grace-Blackwell combinations 200, .. since openbmc fw and redfish schema are the same
+    VeraRubin,
     NvidiaGBSwitch, // GB NVLink switch
     P3809, // dummy for P3809, needs to be set to NvidiaGH200 or NvidiaGBSwitch based on chassis
     LiteOnPowerShelf,
     DeltaPowerShelf,
+    Sushy,
     Unknown,
 }
 
@@ -110,15 +112,25 @@ impl ServiceRoot {
             }
             "nvidia" => match self.product.as_deref() {
                 Some("P3809") => RedfishVendor::P3809, // could be gh200 compute or nvswitch
+                Some("VR NVL72") => RedfishVendor::VeraRubin,
                 Some("GB200 NVL") | Some("GB BMC") => RedfishVendor::NvidiaGBx00,
                 _ => RedfishVendor::NvidiaDpu,
             },
             "wiwynn" => RedfishVendor::NvidiaGBx00,
-            "supermicro" => RedfishVendor::Supermicro,
+            "supermicro" => match self.product.as_deref() {
+                Some("GB NVL") => RedfishVendor::NvidiaGBx00,
+                _ => RedfishVendor::Supermicro,
+            },
             "lite-on technology corp." => RedfishVendor::LiteOnPowerShelf,
-            "delta" => RedfishVendor::DeltaPowerShelf,
+            "delta electronics inc." => RedfishVendor::DeltaPowerShelf,
+            "sushy" | "contoso" | "redvirt" => RedfishVendor::Sushy,
             _ => RedfishVendor::Unknown,
         })
+    }
+
+    /// Vera Rubin compute-tray host BMC.
+    pub fn is_vera_rubin(&self) -> bool {
+        self.vendor() == Some(RedfishVendor::VeraRubin)
     }
 
     /// Check if this system has an AMI-based BMC (indicated by "Ami" key in OEM field)
@@ -152,6 +164,16 @@ mod test {
     }
 
     #[test]
+    fn test_supermicro_gb300_service_root() {
+        let result = ServiceRoot {
+            vendor: Some("Supermicro".to_string()),
+            product: Some("GB NVL".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::NvidiaGBx00);
+    }
+
+    #[test]
     fn test_nvidia_bluefield_service_root() {
         let result = ServiceRoot {
             vendor: Some("NVIDIA".to_string()),
@@ -159,5 +181,37 @@ mod test {
             ..Default::default()
         };
         assert_eq!(result.vendor().unwrap(), RedfishVendor::NvidiaDpu);
+    }
+
+    #[test]
+    fn test_nvidia_vera_rubin_service_root() {
+        let result = ServiceRoot {
+            vendor: Some("NVIDIA".to_string()),
+            product: Some("VR NVL72".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::VeraRubin);
+        assert!(result.is_vera_rubin());
+    }
+
+    #[test]
+    fn test_delta_powershelf_service_root() {
+        // Real Delta power shelves report their full manufacturer string in the
+        // service-root `Vendor` field, not a bare "Delta".
+        let result = ServiceRoot {
+            vendor: Some("Delta Electronics Inc.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::DeltaPowerShelf);
+    }
+
+    #[test]
+    fn test_delta_powershelf_service_root_case_insensitive() {
+        // Matching is case-insensitive (the vendor string is lowercased first).
+        let result = ServiceRoot {
+            vendor: Some("DELTA ELECTRONICS INC.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::DeltaPowerShelf);
     }
 }

@@ -19,6 +19,7 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
+ *
  */
 use crate::{Chassis, EnabledDisabled, REDFISH_ENDPOINT};
 use regex::Regex;
@@ -43,10 +44,10 @@ use crate::{
         power::{Power, PowerSupply, Voltages},
         sel::{LogEntry, LogEntryCollection},
         thermal::{LeakDetector, Temperature, TemperaturesOemNvidia, Thermal},
-        BootOption, ComputerSystem,
+        BootOption,
     },
     standard::RedfishStandard,
-    BiosProfileType, NetworkDeviceFunction, ODataId, Redfish, RedfishError,
+    BiosProfileType, NetworkDeviceFunction, Redfish, RedfishError,
 };
 use crate::{MachineSetupDiff, MachineSetupStatus};
 
@@ -60,32 +61,6 @@ impl Bmc {
     pub fn new(s: RedfishStandard) -> Result<Bmc, RedfishError> {
         Ok(Bmc { s })
     }
-
-    async fn is_supermicro_gb300(&self) -> Result<bool, RedfishError> {
-        let systems = self
-            .s
-            .get_collection(ODataId::from("/redfish/v1/Systems"))
-            .await?
-            .try_get::<ComputerSystem>()?;
-        Ok(systems_are_supermicro_gb300(&systems.members))
-    }
-}
-
-fn systems_are_supermicro_gb300(systems: &[ComputerSystem]) -> bool {
-    let is_supermicro = systems.iter().any(|system| {
-        system
-            .manufacturer
-            .as_deref()
-            .is_some_and(|manufacturer| manufacturer.eq_ignore_ascii_case("supermicro"))
-    });
-    let is_gb300 = systems.iter().any(|system| {
-        system
-            .model
-            .as_deref()
-            .is_some_and(|model| model.contains("GB300"))
-    });
-
-    is_supermicro && is_gb300
 }
 
 #[derive(Copy, Clone)]
@@ -109,6 +84,29 @@ impl BootOptionName {
 enum BootOptionMatchField {
     DisplayName,
     UefiDevicePath,
+}
+
+fn boot_order_entry_reference(entry: &str) -> &str {
+    crate::model::boot::boot_order_entry_reference(entry)
+}
+
+fn dpu_http_boot_display_name_matches(display_name: &str, boot_option_name: &str) -> bool {
+    // Vera Rubin firmware can expose duplicate HTTP entries such as
+    // "UEFI HTTPv4 (MAC:…)" and "UEFI HTTPv4 (MAC:…) 2"; prefix match is ambiguous.
+    display_name == boot_option_name
+}
+
+fn promote_boot_order_entry_first(
+    boot_order: &mut Vec<String>,
+    target_reference: &str,
+) -> Result<(), RedfishError> {
+    if crate::model::boot::promote_boot_order_entry_first(boot_order, target_reference) {
+        Ok(())
+    } else {
+        Err(RedfishError::GenericError {
+            error: format!("Boot option {target_reference} is not present in BootOrder"),
+        })
+    }
 }
 
 impl BootOptionMatchField {
@@ -436,19 +434,6 @@ impl Redfish for Bmc {
         Box::pin(async move { self.get_system_event_log().await })
     }
 
-    fn get_bmc_event_log<'a>(
-        &'a self,
-        from: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> crate::RedfishFuture<'a, Result<Vec<LogEntry>, RedfishError>> {
-        Box::pin(async move {
-            let url = format!(
-                "Systems/{}/LogServices/EventLog/Entries",
-                self.s.system_id()
-            );
-            self.s.fetch_bmc_event_log(url, from).await
-        })
-    }
-
     fn machine_setup<'a>(
         &'a self,
         _boot_interface: Option<crate::BootInterfaceRef<'a>>,
@@ -463,15 +448,9 @@ impl Redfish for Bmc {
         >,
     ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
         Box::pin(async move {
-            let is_supermicro_gb300 = self.is_supermicro_gb300().await?;
+            self.disable_secure_boot().await?;
 
-            // The Supermicro GB300 SecureBoot resource does not expose
-            // SecureBootEnable, so there is no supported setting to change.
-            if !is_supermicro_gb300 {
-                self.disable_secure_boot().await?;
-            }
-
-            let bios_attrs = self.machine_setup_attrs(is_supermicro_gb300).await?;
+            let bios_attrs = self.machine_setup_attrs().await?;
             let mut attrs = HashMap::new();
             attrs.extend(bios_attrs);
             let body = HashMap::from([("Attributes", attrs)]);
@@ -513,7 +492,7 @@ impl Redfish for Bmc {
                 }
             }
 
-            // We don't lockdown on GB200, so we don't need to check for it
+            // We don't lockdown on Vera Rubin, so we don't need to check for it
 
             Ok(MachineSetupStatus {
                 is_done: diffs.is_empty(),
@@ -692,32 +671,6 @@ impl Redfish for Bmc {
         })
     }
 
-    fn reset_bios<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.factory_reset_bios().await })
-    }
-
-    fn enable_secure_boot<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move {
-            if self.is_supermicro_gb300().await? {
-                return Err(RedfishError::NotSupported(
-                    "Supermicro GB300 does not expose SecureBootEnable".to_string(),
-                ));
-            }
-            self.s.enable_secure_boot().await
-        })
-    }
-
-    fn disable_secure_boot<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move {
-            if self.is_supermicro_gb300().await? {
-                return Err(RedfishError::NotSupported(
-                    "Supermicro GB300 does not expose SecureBootEnable".to_string(),
-                ));
-            }
-            self.s.disable_secure_boot().await
-        })
-    }
-
     fn get_system_ethernet_interfaces<'a>(
         &'a self,
     ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
@@ -730,7 +683,7 @@ impl Redfish for Bmc {
     ) -> crate::RedfishFuture<'a, Result<crate::EthernetInterface, RedfishError>> {
         Box::pin(async move {
             Err(RedfishError::NotSupported(format!(
-                "GB200 doesn't have Systems EthernetInterface {id}"
+                "Vera Rubin doesn't have Systems EthernetInterface {id}"
             )))
         })
     }
@@ -825,14 +778,32 @@ impl Redfish for Bmc {
             let mac_address = address.replace(':', "").to_uppercase();
             let boot_option_name =
                 format!("{} (MAC:{})", BootOptionName::Http.to_string(), mac_address);
-            let boot_array = self
-                .get_boot_options_ids_with_first(
-                    BootOptionName::Http,
-                    BootOptionMatchField::DisplayName,
-                    Some(&boot_option_name),
-                )
-                .await?;
-            self.change_boot_order(boot_array).await?;
+            let system = self.s.get_system().await?;
+            let boot_options_id =
+                system
+                    .boot
+                    .boot_options
+                    .clone()
+                    .ok_or_else(|| RedfishError::MissingKey {
+                        key: "boot.boot_options".to_string(),
+                        url: system.odata.odata_id.clone(),
+                    })?;
+            let boot_options: Vec<BootOption> = self
+                .get_collection(boot_options_id)
+                .await
+                .and_then(|collection| collection.try_get::<BootOption>())?
+                .members;
+            let target = boot_options
+                .iter()
+                .find(|option| {
+                    dpu_http_boot_display_name_matches(&option.display_name, &boot_option_name)
+                })
+                .ok_or_else(|| RedfishError::GenericError {
+                    error: format!("Could not find boot option matching {boot_option_name}"),
+                })?;
+            let mut boot_order = system.boot.boot_order;
+            promote_boot_order_entry_first(&mut boot_order, &target.boot_option_reference)?;
+            self.change_boot_order(boot_order).await?;
             Ok(None)
         })
     }
@@ -846,11 +817,6 @@ impl Redfish for Bmc {
 
     fn enable_infinite_boot<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
-            if self.is_supermicro_gb300().await? {
-                return Err(RedfishError::NotSupported(
-                    "Supermicro GB300 does not expose EmbeddedUefiShell".to_string(),
-                ));
-            }
             let attrs: HashMap<String, serde_json::Value> =
                 HashMap::from([("EmbeddedUefiShell".to_string(), "Disabled".into())]);
             let body = HashMap::from([("Attributes", attrs)]);
@@ -863,9 +829,6 @@ impl Redfish for Bmc {
         &'a self,
     ) -> crate::RedfishFuture<'a, Result<Option<bool>, RedfishError>> {
         Box::pin(async move {
-            if self.is_supermicro_gb300().await? {
-                return Ok(None);
-            }
             let embedded_uefi_shell = self.get_embedded_uefi_shell_status().await?;
             // Infinite boot is enabled when EmbeddedUefiShell is disabled
             Ok(Some(embedded_uefi_shell == EnabledDisabled::Disabled))
@@ -931,6 +894,105 @@ impl Redfish for Bmc {
             self.get_firmware(&id).await
         })
     }
+
+    // Get the EastWestControlEnabled attribute for the CX NIC with the given index
+    fn get_spx_nic_east_west_control_enabled<'a>(
+        &'a self,
+        nic_index: u8,
+    ) -> crate::RedfishFuture<'a, Result<Option<bool>, RedfishError>> {
+        Box::pin(async move {
+            if nic_index >= 8 {
+                return Err(RedfishError::GenericError {
+                    error: format!("nic_index {nic_index} out of range; expected 0..8"),
+                });
+            }
+            let url = format!("Chassis/CX_{nic_index}/NetworkAdapters/CX_NIC_{nic_index}/Settings");
+            let (_status_code, body): (StatusCode, HashMap<String, serde_json::Value>) =
+                self.s.client.get(&url).await?;
+            let oem = jsonmap::get_object(&body, "Oem", &url)?;
+            let nvidia = jsonmap::get_object(oem, "Nvidia", &url)?;
+            Ok(Some(jsonmap::get_bool(
+                nvidia,
+                "EastWestControlEnabled",
+                &url,
+            )?))
+        })
+    }
+
+    // Set the EastWestControlEnabled attribute to the given value for the CX NIC with the given index
+    fn set_spx_nic_east_west_control_enabled<'a>(
+        &'a self,
+        nic_index: u8,
+        enabled: bool,
+    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
+        Box::pin(async move {
+            if nic_index >= 8 {
+                return Err(RedfishError::GenericError {
+                    error: format!("nic_index {nic_index} out of range; expected 0..8"),
+                });
+            }
+            let body = serde_json::json!({
+                "Oem": {
+                    "Nvidia": {
+                        "EastWestControlEnabled": enabled
+                    }
+                }
+            });
+            let url = format!("Chassis/CX_{nic_index}/NetworkAdapters/CX_NIC_{nic_index}/Settings");
+            self.s.client.patch(&url, &body).await?;
+            Ok(())
+        })
+    }
+
+    // Get the MAC address for the CX NIC with the given index
+    fn get_spx_nic_mac_address<'a>(
+        &'a self,
+        nic_index: u8,
+    ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
+        Box::pin(async move {
+            if nic_index >= 8 {
+                return Err(RedfishError::GenericError {
+                    error: format!("nic_index {nic_index} out of range; expected 0..8"),
+                });
+            }
+            let url = format!(
+                "Systems/{}/EthernetInterfaces/CX_NIC_{nic_index}_Port_0",
+                self.s.system_id()
+            );
+            let (_status_code, iface): (StatusCode, crate::EthernetInterface) =
+                self.s.client.get(&url).await?;
+            let mac = iface.mac_address.ok_or_else(|| RedfishError::MissingKey {
+                key: "MACAddress".to_string(),
+                url: url.clone(),
+            })?;
+            Ok(Some(mac))
+        })
+    }
+
+    // Get the model and name for the CX NIC with the given index
+    fn get_spx_nic_model_and_name<'a>(
+        &'a self,
+        nic_index: u8,
+    ) -> crate::RedfishFuture<'a, Result<Option<crate::SpxNicModelAndName>, RedfishError>> {
+        Box::pin(async move {
+            if nic_index >= 8 {
+                return Err(RedfishError::GenericError {
+                    error: format!("nic_index {nic_index} out of range; expected 0..8"),
+                });
+            }
+            let chassis_id = format!("CX_{nic_index}");
+            let chassis = self.get_chassis(&chassis_id).await?;
+            let model = chassis.model.ok_or_else(|| RedfishError::MissingKey {
+                key: "Model".to_string(),
+                url: format!("Chassis/{chassis_id}"),
+            })?;
+            let name = chassis.name.ok_or_else(|| RedfishError::MissingKey {
+                key: "Name".to_string(),
+                url: format!("Chassis/{chassis_id}"),
+            })?;
+            Ok(Some(crate::SpxNicModelAndName { model, name }))
+        })
+    }
 }
 
 impl Bmc {
@@ -949,8 +1011,7 @@ impl Bmc {
         }
 
         let bios = self.s.bios_attributes().await?;
-        let is_supermicro_gb300 = self.is_supermicro_gb300().await?;
-        let expected_attrs = self.machine_setup_attrs(is_supermicro_gb300).await?;
+        let expected_attrs = self.machine_setup_attrs().await?;
         for (key, expected) in expected_attrs {
             let Some(actual) = bios.get(&key) else {
                 diffs.push(MachineSetupDiff {
@@ -983,21 +1044,21 @@ impl Bmc {
         let boot_option_name =
             format!("{} (MAC:{})", BootOptionName::Http.to_string(), mac_address);
 
-        let boot_options = self.s.get_system().await?.boot.boot_order;
+        let boot_order = self.s.get_system().await?.boot.boot_order;
 
-        // Get actual first boot option
-        let actual_first_boot_option = if let Some(first) = boot_options.first() {
-            Some(self.s.get_boot_option(first.as_str()).await?.display_name)
+        let actual_first_boot_option = if let Some(first) = boot_order.first() {
+            let reference = boot_order_entry_reference(first.as_str());
+            Some(self.s.get_boot_option(reference).await?.display_name)
         } else {
             None
         };
 
-        // Find expected boot option
         let mut expected_first_boot_option = None;
-        for member in &boot_options {
-            let b = self.s.get_boot_option(member.as_str()).await?;
-            if b.display_name.starts_with(&boot_option_name) {
-                expected_first_boot_option = Some(b.display_name);
+        for entry in &boot_order {
+            let reference = boot_order_entry_reference(entry.as_str());
+            let option = self.s.get_boot_option(reference).await?;
+            if dpu_http_boot_display_name_matches(&option.display_name, &boot_option_name) {
+                expected_first_boot_option = Some(option.display_name);
                 break;
             }
         }
@@ -1061,14 +1122,9 @@ impl Bmc {
             });
         };
 
-        let target_id = target.id.clone();
-
-        // Prepend the found option to the front of the existing boot order
-        let mut ordered = system.boot.boot_order;
-        ordered.retain(|id| id != &target_id);
-        ordered.insert(0, target_id);
-
-        Ok(ordered)
+        let mut boot_order = system.boot.boot_order;
+        promote_boot_order_entry_first(&mut boot_order, &target.boot_option_reference)?;
+        Ok(boot_order)
     }
 
     async fn get_system_event_log(&self) -> Result<Vec<LogEntry>, RedfishError> {
@@ -1079,24 +1135,12 @@ impl Bmc {
         Ok(log_entries)
     }
 
-    async fn machine_setup_attrs(
-        &self,
-        is_supermicro_gb300: bool,
-    ) -> Result<Vec<(String, serde_json::Value)>, RedfishError> {
-        let mut bios_attrs = machine_setup_bios_attrs(is_supermicro_gb300);
-        let current_bios_attributes = self.s.bios_attributes().await?;
-
-        // Enable Option ROM so that the DPU will show up in the Host's network devce list
-        // Otherwise, we will never see the DPU's Host PF MAC in the boot option list
-        if let Some(curr_bios_attributes) = current_bios_attributes.as_object() {
-            for attribute in curr_bios_attributes.keys() {
-                if attribute.contains("Pcie6DisableOptionROM") {
-                    bios_attrs.push((attribute.into(), false.into()));
-                }
-            }
-        }
-
-        Ok(bios_attrs)
+    async fn machine_setup_attrs(&self) -> Result<Vec<(String, serde_json::Value)>, RedfishError> {
+        Ok(vec![
+            ("TPM".into(), "Enabled".into()),
+            ("EmbeddedUefiShell".into(), "Disabled".into()),
+            ("GpuExposeAsPcie".into(), true.into()),
+        ])
     }
 
     // get_embedded_uefi_shell_status returns the current status of the EmbeddedUefiShell BIOS attribute.
@@ -1126,20 +1170,6 @@ impl Bmc {
                 )),
             }),
         }
-    }
-}
-
-fn machine_setup_bios_attrs(is_supermicro_gb300: bool) -> Vec<(String, serde_json::Value)> {
-    if is_supermicro_gb300 {
-        // Supermicro GB300 exposes TPM through this AMI BIOS attribute.
-        vec![("SecurityDeviceSupport".into(), "Enabled".into())]
-    } else {
-        vec![
-            // NVIDIA GB200/GB300 exposes TPM directly.
-            ("TPM".into(), "Enabled".into()),
-            // Disable EmbeddedUefiShell (infinite boot workaround).
-            ("EmbeddedUefiShell".into(), "Disabled".into()),
-        ]
     }
 }
 
@@ -1179,52 +1209,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gb300_machine_setup_uses_vendor_specific_bios_attributes() {
-        let dgx_attrs = machine_setup_bios_attrs(false);
-        assert!(dgx_attrs.contains(&("TPM".into(), "Enabled".into())));
-        assert!(dgx_attrs.contains(&("EmbeddedUefiShell".into(), "Disabled".into())));
-        assert!(!dgx_attrs
-            .iter()
-            .any(|(key, _)| key == "SecurityDeviceSupport"));
-
-        let supermicro_attrs = machine_setup_bios_attrs(true);
-        assert_eq!(
-            supermicro_attrs,
-            vec![("SecurityDeviceSupport".into(), "Enabled".into())]
-        );
+    fn dpu_http_boot_display_name_requires_exact_match() {
+        let boot_option_name = "UEFI HTTPv4 (MAC:F4204D494ECC)";
+        assert!(dpu_http_boot_display_name_matches(
+            "UEFI HTTPv4 (MAC:F4204D494ECC)",
+            boot_option_name,
+        ));
+        assert!(!dpu_http_boot_display_name_matches(
+            "UEFI HTTPv4 (MAC:F4204D494ECC) 2",
+            boot_option_name,
+        ));
     }
 
     #[test]
-    fn systems_are_supermicro_gb300_only_for_supermicro_hardware() {
-        let dgx_systems = vec![ComputerSystem {
-            manufacturer: Some("NVIDIA".into()),
-            model: Some("GB300 NVL".into()),
-            ..Default::default()
-        }];
-        assert!(!systems_are_supermicro_gb300(&dgx_systems));
+    fn boot_order_entry_reference_strips_display_name_suffix() {
+        assert_eq!(boot_order_entry_reference("Boot0019: Ubuntu"), "Boot0019");
+        assert_eq!(boot_order_entry_reference("Boot0010"), "Boot0010");
+    }
 
-        let supermicro_systems = vec![ComputerSystem {
-            manufacturer: Some("Supermicro".into()),
-            model: Some("GB300 NVL".into()),
-            ..Default::default()
-        }];
-        assert!(systems_are_supermicro_gb300(&supermicro_systems));
-
-        let split_systems = vec![
-            ComputerSystem {
-                id: "System_0".into(),
-                manufacturer: Some("Supermicro".into()),
-                model: Some("GB NVL".into()),
-                ..Default::default()
-            },
-            ComputerSystem {
-                id: "HGX_Baseboard_0".into(),
-                manufacturer: Some("NVIDIA".into()),
-                model: Some("GB300 1CPU:2GPU Board PC".into()),
-                ..Default::default()
-            },
+    #[test]
+    fn promote_boot_order_entry_first_preserves_exact_firmware_entry() {
+        let mut boot_order = vec![
+            "Boot0019: Ubuntu".to_string(),
+            "Boot0010: UEFI HTTPv4 (MAC:AA)".to_string(),
         ];
-        assert!(systems_are_supermicro_gb300(&split_systems));
+
+        promote_boot_order_entry_first(&mut boot_order, "Boot0010").unwrap();
+
+        assert_eq!(boot_order[0], "Boot0010: UEFI HTTPv4 (MAC:AA)");
+        assert_eq!(boot_order[1], "Boot0019: Ubuntu");
+    }
+
+    #[test]
+    fn promote_boot_order_entry_first_works_with_bare_references() {
+        let mut boot_order = vec!["Boot0019".to_string(), "Boot0010".to_string()];
+
+        promote_boot_order_entry_first(&mut boot_order, "Boot0010").unwrap();
+
+        assert_eq!(boot_order[0], "Boot0010");
+        assert_eq!(boot_order[1], "Boot0019");
+    }
+
+    #[test]
+    fn promote_boot_order_entry_first_errors_when_reference_missing() {
+        let mut boot_order = vec!["Boot0019: Ubuntu".to_string()];
+
+        let err = promote_boot_order_entry_first(&mut boot_order, "Boot0010").unwrap_err();
+        assert!(matches!(err, RedfishError::GenericError { .. }));
     }
 
     #[test]

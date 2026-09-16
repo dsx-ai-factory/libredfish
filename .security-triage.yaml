@@ -1,0 +1,19 @@
+version: "1.0"
+project: libredfish
+last_updated: "2026-08-25T09:58:00-07:00"
+
+repository_exposure_classification:
+  visibility: Public
+  basis: "Origin is github.com/NVIDIA/libredfish and the repository is publicly accessible."
+  confirmed_by: kdandiwala
+  date: "2026-08-25"
+
+service_exposure_classification:
+  tier: Internal-Sensitive
+  confidence: high
+  basis: "NICo uses libredfish as an internal, outbound BMC client library. NICo's authenticated APIs and operator workflows, along with internal controllers, invoke it for privileged firmware, account, Secure Boot, boot, power, and hardware-management operations. libredfish itself exposes no inbound service."
+  confirmed_by: kdandiwala
+  date: "2026-08-25"
+
+false_positives: []
+accepted_risks: []

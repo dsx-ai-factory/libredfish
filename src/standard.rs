@@ -26,6 +26,7 @@ use reqwest::{header::HeaderName, Method, StatusCode};
 use serde_json::json;
 use tracing::debug;
 
+use crate::model::boot::{self, BootSourceOverrideEnabled};
 use crate::model::certificate::Certificate;
 use crate::model::chassis::Assembly;
 use crate::model::component_integrity::ComponentIntegrities;
@@ -40,7 +41,9 @@ use crate::model::{job::Job, oem::nvidia_dpu::NicMode};
 use crate::model::{
     manager_network_protocol::ManagerNetworkProtocol, update_service::TransferProtocolType,
 };
-use crate::model::{power, thermal, BootOption, InvalidValueError, Manager, Managers, ODataId};
+use crate::model::{
+    power, thermal, BootOption, ComputerSystem, InvalidValueError, Manager, Managers, ODataId,
+};
 use crate::model::{power::Power, update_service::UpdateService};
 use crate::model::{secure_boot::SecureBoot, sensor::GPUSensors};
 use crate::model::{sel::LogEntry, ManagerResetType};
@@ -69,6 +72,9 @@ pub struct RedfishStandard {
     service_root: ServiceRoot,
 }
 impl Redfish for RedfishStandard {
+    fn std_redfish(&self) -> &RedfishStandard {
+        self
+    }
     fn create_user<'a>(
         &'a self,
         username: &'a str,
@@ -144,7 +150,21 @@ impl Redfish for RedfishStandard {
             let url = format!("AccountService/Accounts/{}", account_id);
             let mut data = HashMap::new();
             data.insert("Password", new_pass);
-            let service_root = self.get_service_root().await?;
+            // Some BMCs reject authenticated ServiceRoot reads until the
+            // factory password is changed, while still exposing it
+            // anonymously. Prefer that path so password bootstrap can reach
+            // the account PATCH. Fall back to the existing authenticated
+            // lookup for BMCs that protect or omit vendor details there.
+            let service_root = match self.client.get_anonymous::<ServiceRoot>("").await {
+                Ok((_status, service_root))
+                    if service_root
+                        .vendor()
+                        .is_some_and(|vendor| vendor != RedfishVendor::Unknown) =>
+                {
+                    service_root
+                }
+                _ => self.get_service_root().await?,
+            };
             // AMI BMC requires If-Match header for PATCH requests
             if matches!(
                 service_root.vendor(),
@@ -215,10 +235,16 @@ impl Redfish for RedfishStandard {
         false
     }
 
-    fn bmc_reset<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
+    fn bmc_reset<'a>(
+        &'a self,
+        reset_type: Option<ManagerResetType>,
+    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
-            self.reset_manager(ManagerResetType::GracefulRestart, None)
-                .await
+            self.reset_manager(
+                reset_type.unwrap_or(ManagerResetType::GracefulRestart),
+                None,
+            )
+            .await
         })
     }
 
@@ -409,25 +435,52 @@ impl Redfish for RedfishStandard {
         })
     }
 
-    fn boot_once<'a>(
-        &'a self,
-        _target: Boot,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { Err(RedfishError::NotSupported("boot_once".to_string())) })
+    fn boot_once<'a>(&'a self, target: Boot) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
+        Box::pin(async move {
+            self.set_boot_override(BootOverride {
+                target: target.into(),
+                enabled: BootSourceOverrideEnabled::Once,
+                mode: None,
+                http_boot_uri: None,
+            })
+            .await?;
+            Ok(())
+        })
     }
 
     fn boot_first<'a>(
         &'a self,
-        _target: Boot,
+        target: Boot,
     ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { Err(RedfishError::NotSupported("boot_first".to_string())) })
+        Box::pin(async move {
+            self.set_boot_override(BootOverride {
+                target: target.into(),
+                enabled: BootSourceOverrideEnabled::Continuous,
+                mode: None,
+                http_boot_uri: None,
+            })
+            .await?;
+            Ok(())
+        })
     }
 
     fn set_boot_override<'a>(
         &'a self,
-        _settings: BootOverride,
+        settings: BootOverride,
     ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
-        Box::pin(async move { Err(RedfishError::NotSupported("set_boot_override".to_string())) })
+        Box::pin(async move {
+            let boot = boot::Boot {
+                boot_source_override_target: Some(settings.target),
+                boot_source_override_enabled: Some(settings.enabled),
+                boot_source_override_mode: settings.mode,
+                http_boot_uri: settings.http_boot_uri,
+                ..Default::default()
+            };
+            let body = HashMap::from([("Boot", boot)]);
+            let url = format!("Systems/{}", self.system_id());
+            self.client.patch(&url, body).await?;
+            Ok(None)
+        })
     }
 
     fn clear_tpm<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
@@ -772,19 +825,32 @@ impl Redfish for RedfishStandard {
 
     fn get_ports<'a>(
         &'a self,
-        _chassis_id: &'a str,
-        _network_adapter: &'a str,
+        chassis_id: &'a str,
+        network_adapter: &'a str,
     ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { Err(RedfishError::NotSupported("get_ports".to_string())) })
+        Box::pin(async move {
+            let url = format!(
+                "Chassis/{}/NetworkAdapters/{}/Ports",
+                chassis_id, network_adapter
+            );
+            self.get_members(&url).await
+        })
     }
 
     fn get_port<'a>(
         &'a self,
-        _chassis_id: &'a str,
-        _network_adapter: &'a str,
-        _id: &'a str,
+        chassis_id: &'a str,
+        network_adapter: &'a str,
+        id: &'a str,
     ) -> crate::RedfishFuture<'a, Result<NetworkPort, RedfishError>> {
-        Box::pin(async move { Err(RedfishError::NotSupported("get_port".to_string())) })
+        Box::pin(async move {
+            let url = format!(
+                "Chassis/{}/NetworkAdapters/{}/Ports/{}",
+                chassis_id, network_adapter, id
+            );
+            let (_status_code, body) = self.client.get(&url).await?;
+            Ok(body)
+        })
     }
 
     fn change_uefi_password<'a>(
@@ -1251,6 +1317,47 @@ impl Redfish for RedfishStandard {
         })
     }
 
+    fn get_spx_nic_east_west_control_enabled<'a>(
+        &'a self,
+        _nic_index: u8,
+    ) -> crate::RedfishFuture<'a, Result<Option<bool>, RedfishError>> {
+        Box::pin(async move {
+            // Not applicable for non-Vera-Rubin vendors
+            Ok(None)
+        })
+    }
+
+    fn set_spx_nic_east_west_control_enabled<'a>(
+        &'a self,
+        _nic_index: u8,
+        _enabled: bool,
+    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
+        Box::pin(async move {
+            // No-op for non-Vera-Rubin vendors
+            Ok(())
+        })
+    }
+
+    fn get_spx_nic_mac_address<'a>(
+        &'a self,
+        _nic_index: u8,
+    ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
+        Box::pin(async move {
+            // Not applicable for non-Vera-Rubin vendors
+            Ok(None)
+        })
+    }
+
+    fn get_spx_nic_model_and_name<'a>(
+        &'a self,
+        _nic_index: u8,
+    ) -> crate::RedfishFuture<'a, Result<Option<crate::SpxNicModelAndName>, RedfishError>> {
+        Box::pin(async move {
+            // Not applicable for non-Vera-Rubin vendors
+            Ok(None)
+        })
+    }
+
     fn set_ntp_servers<'a>(
         &'a self,
         servers: &'a [String],
@@ -1324,6 +1431,9 @@ impl RedfishStandard {
             RedfishVendor::NvidiaGBx00 => {
                 Ok(Box::new(crate::nvidia_gbx00::Bmc::new(self.clone())?))
             }
+            RedfishVendor::VeraRubin => {
+                Ok(Box::new(crate::nvidia_vera_rubin::Bmc::new(self.clone())?))
+            }
             RedfishVendor::NvidiaGBSwitch => {
                 Ok(Box::new(crate::nvidia_gbswitch::Bmc::new(self.clone())?))
             }
@@ -1337,6 +1447,7 @@ impl RedfishStandard {
             RedfishVendor::DeltaPowerShelf => {
                 Ok(Box::new(crate::delta_powershelf::Bmc::new(self.clone())?))
             }
+            RedfishVendor::Sushy => Ok(Box::new(crate::sushy::Bmc::new(self.clone())?)),
             _ => Ok(Box::new(self.clone())),
         }
     }
@@ -1427,6 +1538,17 @@ impl RedfishStandard {
             .replace(&format!("/{REDFISH_ENDPOINT}/"), "");
         let b: BootOption = self.client.get(&url).await?.1;
         Ok(b)
+    }
+
+    pub fn get_manager_with_id<'a>(
+        &'a self,
+        manager_id: &'a str,
+    ) -> crate::RedfishFuture<'a, Result<Manager, RedfishError>> {
+        Box::pin(async move {
+            let (_, manager): (_, Manager) =
+                self.client.get(&format!("Managers/{}", manager_id)).await?;
+            Ok(manager)
+        })
     }
 
     pub async fn fetch_bmc_event_log(
@@ -1531,12 +1653,20 @@ impl RedfishStandard {
             })
     }
 
+    pub async fn if_system_has_bios(&self, system_id: &str) -> Option<ComputerSystem> {
+        self.client
+            .get::<ComputerSystem>(&format!("Systems/{system_id}"))
+            .await
+            .map_or(None, |(_code, cs)| Some(cs))
+            .and_then(|cs| if cs.bios.is_some() { Some(cs) } else { None })
+    }
+
     pub async fn factory_reset_bios(&self) -> Result<(), RedfishError> {
         let url = format!("Systems/{}/Bios/Actions/Bios.ResetBios", self.system_id());
         self.client
-            .req::<(), ()>(Method::POST, &url, None, None, None, Vec::new())
+            .post(&url, HashMap::<String, String>::new())
             .await
-            .map(|_resp| Ok(()))?
+            .map(|_| ())
     }
 
     pub async fn get_account_by_id(
@@ -1735,7 +1865,13 @@ impl RedfishStandard {
             self.vendor,
             Some(RedfishVendor::AMI | RedfishVendor::LenovoAMI | RedfishVendor::LenovoGB300)
         ) {
-            self.client.patch_with_if_match(&url, ntp_servers).await
+            match self.client.patch_with_if_match(&url, ntp_servers).await {
+                Err(RedfishError::HTTPErrorCode {
+                    status_code: StatusCode::ACCEPTED,
+                    ..
+                }) => Ok(()),
+                result => result,
+            }
         } else {
             self.client.patch(&url, ntp_servers).await.map(|_resp| ())
         }

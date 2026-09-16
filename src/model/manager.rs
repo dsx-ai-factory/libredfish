@@ -59,6 +59,16 @@ pub struct Manager {
     #[serde(rename = "UUID")]
     pub uuid: Option<String>,
     pub oem: Option<ManagerExtensions>,
+    pub links: Option<ManagerLinks>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct ManagerLinks {
+    #[serde(default)]
+    pub manager_for_servers: Vec<ODataId>,
+    #[serde(default)]
+    pub manager_for_chassis: Vec<ODataId>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -27,3 +27,9 @@ pub struct SystemExtensions {
 pub struct ChassisExtensions {
     pub nvidia: Option<nvidia_openbmc::ChassisExtensions>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct PortExtensions {
+    pub lenovo: Option<lenovo::Port>,
+}

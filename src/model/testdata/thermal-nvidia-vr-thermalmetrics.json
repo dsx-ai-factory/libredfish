@@ -1,0 +1,13 @@
+{
+    "@odata.id": "/redfish/v1/Chassis/BMC_0/ThermalSubsystem/ThermalMetrics",
+    "@odata.type": "#ThermalMetrics.v1_0_1.ThermalMetrics",
+    "Id": "ThermalMetrics",
+    "Name": "Chassis Thermal Metrics",
+    "TemperatureReadingsCelsius": [
+        {
+            "DataSourceUri": "/redfish/v1/Chassis/BMC_0/Sensors/BMC_0_Temp_0",
+            "DeviceName": "BMC_0_Temp_0",
+            "Reading": 56.062
+        }
+    ]
+}

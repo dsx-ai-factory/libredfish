@@ -28,35 +28,17 @@ use tokio::fs::File;
 
 use crate::{
     model::{
-        account_service::ManagerAccount,
-        boot::{
-            self, BootOverride, BootSourceOverrideEnabled, BootSourceOverrideMode,
-            BootSourceOverrideTarget,
-        },
-        certificate::Certificate,
-        chassis::{Assembly, Chassis, NetworkAdapter},
-        component_integrity::ComponentIntegrities,
-        network_device_function::NetworkDeviceFunction,
-        oem::{
-            nvidia_dpu::{HostPrivilegeLevel, NicMode},
-            supermicro::{self, FixedBootOrder},
-        },
-        power::Power,
-        secure_boot::SecureBoot,
-        sel::LogEntry,
-        sensor::GPUSensors,
-        service_root::{RedfishVendor, ServiceRoot},
-        software_inventory::SoftwareInventory,
-        storage::Drives,
+        boot::{self, BootOverride, BootSourceOverrideEnabled, BootSourceOverrideMode},
+        chassis::Chassis,
+        oem::supermicro::{self, FixedBootOrder},
+        service_root::RedfishVendor,
         task::Task,
-        thermal::Thermal,
-        update_service::{ComponentType, TransferProtocolType, UpdateService},
-        BootOption, ComputerSystem, EnableDisable, InvalidValueError, Manager,
+        update_service::ComponentType,
+        BootOption, EnableDisable, InvalidValueError,
     },
     standard::RedfishStandard,
-    BiosProfileType, Boot, BootOptions, Collection, EnabledDisabled, JobState, MachineSetupDiff,
-    MachineSetupStatus, ODataId, PCIeDevice, PowerState, Redfish, RedfishError, Resource, RoleId,
-    Status, StatusInternal, SystemPowerControl,
+    BiosProfileType, Boot, EnabledDisabled, MachineSetupDiff, MachineSetupStatus, ODataId,
+    PCIeDevice, Redfish, RedfishError, Status, StatusInternal, SystemPowerControl,
 };
 
 const MELLANOX_UEFI_HTTP_IPV4: &str = "UEFI HTTP IPv4 Mellanox Network Adapter";
@@ -65,18 +47,101 @@ const NVIDIA_UEFI_HTTP_IPV4: &str = "UEFI HTTP IPv4 Nvidia Network Adapter";
 /// MGX C2 systems use SSIF instead of x86 KCS for in-band BMC communication,
 /// so the KCSInterface endpoint doesn't exist. These models require the
 /// IPMIHostInterface fallback on Systems/{id}.
-const MGX_C2_MODELS: [&str; 4] = [
-    "ARS-121L-DNR",
-    "ARS-221GL-NR",
-    "SYS-221H-TNR",
-    "SYS-221H-TN24R",
-];
+const MGX_C2_PROCESSOR_MODULE_MODEL_PREFIX: &str = "PG535";
+const MGX_C2_PROCESSOR_MODULE_PART_NUMBER_FRAGMENT: &str = "2G535";
 
 /// Minimum BMC firmware version that exposes `IPMIHostInterface` on
 /// `Systems/{id}` for MGX C2 systems.
 const MIN_BMC_FW_IPMI_HOST_IFACE: &str = "01.05.01";
 const HARD_DISK: &str = "UEFI Hard Disk";
 const NETWORK: &str = "UEFI Network";
+
+fn usable_standard_boot_order(boot_order: Vec<String>) -> Option<Vec<String>> {
+    (!boot_order.is_empty()).then_some(boot_order)
+}
+
+fn is_supported_uefi_http_boot_option(display_name: &str) -> bool {
+    display_name.contains(MELLANOX_UEFI_HTTP_IPV4) || display_name.contains(NVIDIA_UEFI_HTTP_IPV4)
+}
+
+fn http_boot_option_matches_mac(display_name: &str, boot_interface_mac: &str) -> bool {
+    is_supported_uefi_http_boot_option(display_name)
+        && display_name
+            .to_ascii_uppercase()
+            .contains(&boot_interface_mac.to_ascii_uppercase())
+}
+
+fn standard_boot_order_diff(
+    boot_order: &[String],
+    boot_options: &[BootOption],
+    boot_interface_mac: &str,
+) -> Option<MachineSetupDiff> {
+    let target = boot_options
+        .iter()
+        .find(|option| http_boot_option_matches_mac(&option.display_name, boot_interface_mac));
+    let actual_reference = boot_order
+        .first()
+        .map(|entry| boot::boot_order_entry_reference(entry));
+
+    if target.is_some_and(|option| actual_reference == Some(option.boot_option_reference.as_str()))
+    {
+        return None;
+    }
+
+    let expected = target
+        .map(|option| option.display_name.clone())
+        .unwrap_or_else(|| "Not found".to_string());
+    let actual = actual_reference
+        .and_then(|reference| {
+            boot_options
+                .iter()
+                .find(|option| option.boot_option_reference == reference)
+        })
+        .map(|option| option.display_name.clone())
+        .unwrap_or_else(|| "Not found".to_string());
+
+    Some(MachineSetupDiff {
+        key: "boot_first".to_string(),
+        expected,
+        actual,
+    })
+}
+
+fn fixed_boot_order_diff(
+    fixed_boot_order: &[String],
+    uefi_network: &[String],
+    boot_interface_mac: &str,
+) -> Option<MachineSetupDiff> {
+    let expected = uefi_network
+        .iter()
+        .find(|entry| http_boot_option_matches_mac(entry, boot_interface_mac))
+        .cloned();
+    let actual = fixed_boot_order.first().map(|entry| {
+        let network_category = entry
+            .strip_prefix(NETWORK)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(':'));
+        if network_category {
+            uefi_network
+                .first()
+                .cloned()
+                .unwrap_or_else(|| entry.clone())
+        } else if let Some((_, option)) = entry.split_once(':') {
+            option.trim().to_string()
+        } else {
+            entry.clone()
+        }
+    });
+
+    if expected.is_some() && expected == actual {
+        return None;
+    }
+
+    Some(MachineSetupDiff {
+        key: "boot_first".to_string(),
+        expected: expected.unwrap_or_else(|| "Not found".to_string()),
+        actual: actual.unwrap_or_else(|| "Not found".to_string()),
+    })
+}
 
 pub struct Bmc {
     s: RedfishStandard,
@@ -88,60 +153,9 @@ impl Bmc {
     }
 }
 impl Redfish for Bmc {
-    fn create_user<'a>(
-        &'a self,
-        username: &'a str,
-        password: &'a str,
-        role_id: RoleId,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.create_user(username, password, role_id).await })
+    fn std_redfish(&self) -> &RedfishStandard {
+        &self.s
     }
-
-    fn delete_user<'a>(
-        &'a self,
-        username: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.delete_user(username).await })
-    }
-
-    fn change_username<'a>(
-        &'a self,
-        old_name: &'a str,
-        new_name: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.change_username(old_name, new_name).await })
-    }
-
-    fn change_password<'a>(
-        &'a self,
-        username: &'a str,
-        new_password: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.change_password(username, new_password).await })
-    }
-
-    fn change_password_by_id<'a>(
-        &'a self,
-        account_id: &'a str,
-        new_pass: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.change_password_by_id(account_id, new_pass).await })
-    }
-
-    fn get_accounts<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Vec<ManagerAccount>, RedfishError>> {
-        Box::pin(async move { self.s.get_accounts().await })
-    }
-
-    fn get_power_state<'a>(&'a self) -> crate::RedfishFuture<'a, Result<PowerState, RedfishError>> {
-        Box::pin(async move { self.s.get_power_state().await })
-    }
-
-    fn get_power_metrics<'a>(&'a self) -> crate::RedfishFuture<'a, Result<Power, RedfishError>> {
-        Box::pin(async move { self.s.get_power_metrics().await })
-    }
-
     fn power<'a>(
         &'a self,
         action: SystemPowerControl,
@@ -162,62 +176,6 @@ impl Redfish for Bmc {
 
     fn ac_powercycle_supported_by_power(&self) -> bool {
         true
-    }
-
-    fn bmc_reset<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.bmc_reset().await })
-    }
-
-    fn chassis_reset<'a>(
-        &'a self,
-        chassis_id: &'a str,
-        reset_type: SystemPowerControl,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.chassis_reset(chassis_id, reset_type).await })
-    }
-
-    fn get_thermal_metrics<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Thermal, RedfishError>> {
-        Box::pin(async move { self.s.get_thermal_metrics().await })
-    }
-
-    fn get_gpu_sensors<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Vec<GPUSensors>, RedfishError>> {
-        Box::pin(async move { self.s.get_gpu_sensors().await })
-    }
-
-    fn get_system_event_log<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Vec<LogEntry>, RedfishError>> {
-        Box::pin(async move { self.s.get_system_event_log().await })
-    }
-
-    fn get_bmc_event_log<'a>(
-        &'a self,
-        from: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> crate::RedfishFuture<'a, Result<Vec<LogEntry>, RedfishError>> {
-        Box::pin(async move { self.s.get_bmc_event_log(from).await })
-    }
-
-    fn get_drives_metrics<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Vec<Drives>, RedfishError>> {
-        Box::pin(async move { self.s.get_drives_metrics().await })
-    }
-
-    fn bios<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<HashMap<String, serde_json::Value>, RedfishError>> {
-        Box::pin(async move { self.s.bios().await })
-    }
-
-    fn set_bios<'a>(
-        &'a self,
-        values: HashMap<String, serde_json::Value>,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.set_bios(values).await })
     }
 
     fn reset_bios<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
@@ -274,14 +232,8 @@ impl Redfish for Bmc {
 
             // Check the first boot option
             if let Some(mac) = boot_interface_mac {
-                let (expected, actual) =
-                    self.get_expected_and_actual_first_boot_option(mac).await?;
-                if expected.is_none() || expected != actual {
-                    diffs.push(MachineSetupDiff {
-                        key: "boot_first".to_string(),
-                        expected: expected.unwrap_or_else(|| "Not found".to_string()),
-                        actual: actual.unwrap_or_else(|| "Not found".to_string()),
-                    });
+                if let Some(diff) = self.boot_order_diff(mac).await? {
+                    diffs.push(diff);
                 }
             }
 
@@ -328,8 +280,8 @@ impl Redfish for Bmc {
             use EnabledDisabled::*;
             match target {
                 Enabled => {
-                    // Grace-Grace SMCs can't PXE boot if host interface is disabled
-                    if !self.is_grace_grace_smc().await? {
+                    // ARS-121L-DNR can't PXE boot if the host interface is disabled.
+                    if !self.is_ars_121l_dnr().await? {
                         self.set_host_interfaces(Disabled).await?;
                     }
                     self.set_kcs_privilege(supermicro::Privilege::Callback)
@@ -355,15 +307,15 @@ impl Redfish for Bmc {
             let is_syslockdown = self.get_syslockdown().await?;
             let message = format!("SysLockdownEnabled={is_syslockdown}, kcs_privilege={kcs_privilege:#?}, host_interface_enabled={is_hi_on}");
 
-            // Grace-Grace SMCs (ARS-121L-DNR) need host_interface enabled even with lockdown
-            let is_grace_grace = self.is_grace_grace_smc().await?;
+            let must_keep_host_interface_enabled = self.is_ars_121l_dnr().await?;
+            let kcs_locked =
+                kcs_privilege.is_none() || kcs_privilege == Some(supermicro::Privilege::Callback);
+            let kcs_unlocked = kcs_privilege.is_none()
+                || kcs_privilege == Some(supermicro::Privilege::Administrator);
 
-            let is_locked = is_syslockdown
-                && kcs_privilege == supermicro::Privilege::Callback
-                && (is_grace_grace || !is_hi_on);
-            let is_unlocked = !is_syslockdown
-                && kcs_privilege == supermicro::Privilege::Administrator
-                && is_hi_on;
+            let is_locked =
+                is_syslockdown && kcs_locked && (must_keep_host_interface_enabled || !is_hi_on);
+            let is_unlocked = !is_syslockdown && kcs_unlocked && is_hi_on;
             Ok(Status {
                 message,
                 status: if is_locked {
@@ -409,30 +361,13 @@ impl Redfish for Bmc {
         })
     }
 
-    fn get_boot_options<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<BootOptions, RedfishError>> {
-        Box::pin(async move { self.s.get_boot_options().await })
-    }
-
-    fn get_boot_option<'a>(
-        &'a self,
-        option_id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<BootOption, RedfishError>> {
-        Box::pin(async move { self.s.get_boot_option(option_id).await })
-    }
-
     /// Boot from this device once then go back to the normal boot order
     fn boot_once<'a>(&'a self, target: Boot) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
             Redfish::set_boot_override(
                 self,
                 BootOverride {
-                    target: match target {
-                        Boot::Pxe => BootSourceOverrideTarget::Pxe,
-                        Boot::HardDisk => BootSourceOverrideTarget::Hdd,
-                        Boot::UefiHttp => BootSourceOverrideTarget::UefiHttp,
-                    },
+                    target: target.into(),
                     enabled: BootSourceOverrideEnabled::Once,
                     mode: None,
                     http_boot_uri: None,
@@ -458,11 +393,7 @@ impl Redfish for Bmc {
                     Redfish::set_boot_override(
                         self,
                         BootOverride {
-                            target: match target {
-                                Boot::Pxe => BootSourceOverrideTarget::Pxe,
-                                Boot::HardDisk => BootSourceOverrideTarget::Hdd,
-                                Boot::UefiHttp => BootSourceOverrideTarget::UefiHttp,
-                            },
+                            target: target.into(),
                             enabled: BootSourceOverrideEnabled::Continuous,
                             mode: None,
                             http_boot_uri: None,
@@ -573,13 +504,6 @@ impl Redfish for Bmc {
         })
     }
 
-    fn update_firmware<'a>(
-        &'a self,
-        firmware: tokio::fs::File,
-    ) -> crate::RedfishFuture<'a, Result<crate::model::task::Task, RedfishError>> {
-        Box::pin(async move { self.s.update_firmware(firmware).await })
-    }
-
     fn update_firmware_multipart<'a>(
         &'a self,
         filename: &'a Path,
@@ -630,208 +554,6 @@ impl Redfish for Bmc {
         })
     }
 
-    fn get_update_service<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<UpdateService, RedfishError>> {
-        Box::pin(async move { self.s.get_update_service().await })
-    }
-
-    fn get_tasks<'a>(&'a self) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_tasks().await })
-    }
-
-    fn get_task<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<crate::model::task::Task, RedfishError>> {
-        Box::pin(async move { self.s.get_task(id).await })
-    }
-
-    fn get_firmware<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<SoftwareInventory, RedfishError>> {
-        Box::pin(async move { self.s.get_firmware(id).await })
-    }
-
-    fn get_software_inventories<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_software_inventories().await })
-    }
-
-    fn get_system<'a>(&'a self) -> crate::RedfishFuture<'a, Result<ComputerSystem, RedfishError>> {
-        Box::pin(async move { self.s.get_system().await })
-    }
-
-    fn get_secure_boot_certificates<'a>(
-        &'a self,
-        database_id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_secure_boot_certificates(database_id).await })
-    }
-
-    fn get_secure_boot_certificate<'a>(
-        &'a self,
-        database_id: &'a str,
-        certificate_id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Certificate, RedfishError>> {
-        Box::pin(async move {
-            self.s
-                .get_secure_boot_certificate(database_id, certificate_id)
-                .await
-        })
-    }
-
-    fn add_secure_boot_certificate<'a>(
-        &'a self,
-        pem_cert: &'a str,
-        database_id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Task, RedfishError>> {
-        Box::pin(async move {
-            self.s
-                .add_secure_boot_certificate(pem_cert, database_id)
-                .await
-        })
-    }
-
-    fn get_secure_boot<'a>(&'a self) -> crate::RedfishFuture<'a, Result<SecureBoot, RedfishError>> {
-        Box::pin(async move { self.s.get_secure_boot().await })
-    }
-
-    fn enable_secure_boot<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.enable_secure_boot().await })
-    }
-
-    fn disable_secure_boot<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.disable_secure_boot().await })
-    }
-
-    fn get_network_device_function<'a>(
-        &'a self,
-        chassis_id: &'a str,
-        id: &'a str,
-        port: Option<&'a str>,
-    ) -> crate::RedfishFuture<'a, Result<NetworkDeviceFunction, RedfishError>> {
-        Box::pin(async move {
-            self.s
-                .get_network_device_function(chassis_id, id, port)
-                .await
-        })
-    }
-
-    fn get_network_device_functions<'a>(
-        &'a self,
-        chassis_id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_network_device_functions(chassis_id).await })
-    }
-
-    fn get_chassis_all<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_chassis_all().await })
-    }
-
-    fn get_chassis<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Chassis, RedfishError>> {
-        Box::pin(async move { self.s.get_chassis(id).await })
-    }
-
-    fn get_chassis_assembly<'a>(
-        &'a self,
-        chassis_id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Assembly, RedfishError>> {
-        Box::pin(async move { self.s.get_chassis_assembly(chassis_id).await })
-    }
-
-    fn get_chassis_network_adapters<'a>(
-        &'a self,
-        chassis_id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_chassis_network_adapters(chassis_id).await })
-    }
-
-    fn get_chassis_network_adapter<'a>(
-        &'a self,
-        chassis_id: &'a str,
-        id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<NetworkAdapter, RedfishError>> {
-        Box::pin(async move { self.s.get_chassis_network_adapter(chassis_id, id).await })
-    }
-
-    fn get_base_network_adapters<'a>(
-        &'a self,
-        system_id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_base_network_adapters(system_id).await })
-    }
-
-    fn get_base_network_adapter<'a>(
-        &'a self,
-        system_id: &'a str,
-        id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<NetworkAdapter, RedfishError>> {
-        Box::pin(async move { self.s.get_base_network_adapter(system_id, id).await })
-    }
-
-    fn get_ports<'a>(
-        &'a self,
-        chassis_id: &'a str,
-        network_adapter: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_ports(chassis_id, network_adapter).await })
-    }
-
-    fn get_port<'a>(
-        &'a self,
-        chassis_id: &'a str,
-        network_adapter: &'a str,
-        id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<crate::NetworkPort, RedfishError>> {
-        Box::pin(async move { self.s.get_port(chassis_id, network_adapter, id).await })
-    }
-
-    fn get_manager_ethernet_interfaces<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_manager_ethernet_interfaces().await })
-    }
-
-    fn get_manager_ethernet_interface<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<crate::EthernetInterface, RedfishError>> {
-        Box::pin(async move { self.s.get_manager_ethernet_interface(id).await })
-    }
-
-    fn get_system_ethernet_interfaces<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_system_ethernet_interfaces().await })
-    }
-
-    fn get_system_ethernet_interface<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<crate::EthernetInterface, RedfishError>> {
-        Box::pin(async move { self.s.get_system_ethernet_interface(id).await })
-    }
-
-    fn change_uefi_password<'a>(
-        &'a self,
-        current_uefi_password: &'a str,
-        new_uefi_password: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
-        Box::pin(async move {
-            self.s
-                .change_uefi_password(current_uefi_password, new_uefi_password)
-                .await
-        })
-    }
-
     fn change_boot_order<'a>(
         &'a self,
         boot_array: Vec<String>,
@@ -841,24 +563,6 @@ impl Redfish for Bmc {
             let url = format!("Systems/{}", self.s.system_id());
             self.s.client.patch(&url, body).await.map(|_status_code| ())
         })
-    }
-
-    fn get_service_root<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<ServiceRoot, RedfishError>> {
-        Box::pin(async move { self.s.get_service_root().await })
-    }
-
-    fn get_systems<'a>(&'a self) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_systems().await })
-    }
-
-    fn get_managers<'a>(&'a self) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_managers().await })
-    }
-
-    fn get_manager<'a>(&'a self) -> crate::RedfishFuture<'a, Result<Manager, RedfishError>> {
-        Box::pin(async move { self.s.get_manager().await })
     }
 
     fn bmc_reset_to_defaults<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
@@ -878,27 +582,6 @@ impl Redfish for Bmc {
         })
     }
 
-    fn get_job_state<'a>(
-        &'a self,
-        job_id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<JobState, RedfishError>> {
-        Box::pin(async move { self.s.get_job_state(job_id).await })
-    }
-
-    fn get_collection<'a>(
-        &'a self,
-        id: ODataId,
-    ) -> crate::RedfishFuture<'a, Result<Collection, RedfishError>> {
-        Box::pin(async move { self.s.get_collection(id).await })
-    }
-
-    fn get_resource<'a>(
-        &'a self,
-        id: ODataId,
-    ) -> crate::RedfishFuture<'a, Result<Resource, RedfishError>> {
-        Box::pin(async move { self.s.get_resource(id).await })
-    }
-
     /// Set the DPU to be our first netboot device.
     /// The HTTP adapter will only appear after IPv4HTTPSupport bios setting is enabled and the host rebooted.
     fn set_boot_order_dpu_first<'a>(
@@ -908,8 +591,12 @@ impl Redfish for Bmc {
         Box::pin(async move {
             let mac_address = crate::resolve_boot_interface_mac(self, boot_interface).await?;
             let mac_address = mac_address.as_str();
-            match self.set_mellanox_first(mac_address).await {
-                Ok(_) => return Ok(None),
+            match self
+                .try_set_standard_boot_order_dpu_first(mac_address)
+                .await
+            {
+                Ok(true) => return Ok(None),
+                Ok(false) => {}
                 Err(RedfishError::HTTPErrorCode {
                     status_code,
                     response_body,
@@ -924,7 +611,7 @@ impl Redfish for Bmc {
                 Err(e) => return Err(e),
             }
 
-            // Some supermicro models don't support the set_mellanox_first method, so we fall back to this method
+            // Some Supermicro models only expose the OEM fixed boot order.
             let mut fbo = self.get_boot_order().await?;
 
             // The network name is not consistent because it includes the interface name.
@@ -954,12 +641,7 @@ impl Redfish for Bmc {
             let Some(pos) = fbo
                 .uefi_network
                 .iter()
-                .position(|s| s.contains("UEFI HTTP IPv4 Mellanox") && s.contains(mac_address))
-                .or_else(|| {
-                    fbo.uefi_network.iter().position(|s| {
-                        s.contains("UEFI HTTP IPv4 Nvidia") && s.contains(mac_address)
-                    })
-                })
+                .position(|entry| http_boot_option_matches_mac(entry, mac_address))
             else {
                 return Err(RedfishError::NotSupported(
                 format!("No match for Mellanox/Nvidia HTTP adapter with MAC address {} in network boot order", mac_address)
@@ -994,119 +676,11 @@ impl Redfish for Bmc {
         Box::pin(async move { self.change_uefi_password(current_uefi_password, "").await })
     }
 
-    fn get_base_mac_address<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_base_mac_address().await })
-    }
-
     fn lockdown_bmc<'a>(
         &'a self,
         target: crate::EnabledDisabled,
     ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move { self.set_syslockdown(target).await })
-    }
-
-    fn is_ipmi_over_lan_enabled<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
-        Box::pin(async move { self.s.is_ipmi_over_lan_enabled().await })
-    }
-
-    fn enable_ipmi_over_lan<'a>(
-        &'a self,
-        target: crate::EnabledDisabled,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.enable_ipmi_over_lan(target).await })
-    }
-
-    fn update_firmware_simple_update<'a>(
-        &'a self,
-        image_uri: &'a str,
-        targets: Vec<String>,
-        transfer_protocol: TransferProtocolType,
-    ) -> crate::RedfishFuture<'a, Result<Task, RedfishError>> {
-        Box::pin(async move {
-            self.s
-                .update_firmware_simple_update(image_uri, targets, transfer_protocol)
-                .await
-        })
-    }
-
-    fn enable_rshim_bmc<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.enable_rshim_bmc().await })
-    }
-
-    fn clear_nvram<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.clear_nvram().await })
-    }
-
-    fn get_nic_mode<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Option<NicMode>, RedfishError>> {
-        Box::pin(async move { self.s.get_nic_mode().await })
-    }
-
-    fn set_nic_mode<'a>(
-        &'a self,
-        mode: NicMode,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.set_nic_mode(mode).await })
-    }
-
-    fn enable_infinite_boot<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.enable_infinite_boot().await })
-    }
-
-    fn is_infinite_boot_enabled<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Option<bool>, RedfishError>> {
-        Box::pin(async move { self.s.is_infinite_boot_enabled().await })
-    }
-
-    fn set_host_rshim<'a>(
-        &'a self,
-        enabled: EnabledDisabled,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.set_host_rshim(enabled).await })
-    }
-
-    fn get_host_rshim<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Option<EnabledDisabled>, RedfishError>> {
-        Box::pin(async move { self.s.get_host_rshim().await })
-    }
-
-    fn set_idrac_lockdown<'a>(
-        &'a self,
-        enabled: EnabledDisabled,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.set_idrac_lockdown(enabled).await })
-    }
-
-    fn get_boss_controller<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
-        Box::pin(async move { self.s.get_boss_controller().await })
-    }
-
-    fn decommission_storage_controller<'a>(
-        &'a self,
-        controller_id: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
-        Box::pin(async move { self.s.decommission_storage_controller(controller_id).await })
-    }
-
-    fn create_storage_volume<'a>(
-        &'a self,
-        controller_id: &'a str,
-        volume_name: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
-        Box::pin(async move {
-            self.s
-                .create_storage_volume(controller_id, volume_name)
-                .await
-        })
     }
 
     fn is_boot_order_setup<'a>(
@@ -1115,8 +689,7 @@ impl Redfish for Bmc {
     ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
         Box::pin(async move {
             let mac = crate::resolve_boot_interface_mac(self, boot_interface).await?;
-            let (expected, actual) = self.get_expected_and_actual_first_boot_option(&mac).await?;
-            Ok(expected.is_some() && expected == actual)
+            Ok(self.boot_order_diff(&mac).await?.is_none())
         })
     }
 
@@ -1128,70 +701,6 @@ impl Redfish for Bmc {
             let diffs = self.diff_bios_bmc_attr().await?;
             Ok(diffs.is_empty())
         })
-    }
-
-    fn get_component_integrities<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<ComponentIntegrities, RedfishError>> {
-        Box::pin(async move { self.s.get_component_integrities().await })
-    }
-
-    fn get_firmware_for_component<'a>(
-        &'a self,
-        componnent_integrity_id: &'a str,
-    ) -> crate::RedfishFuture<
-        'a,
-        Result<crate::model::software_inventory::SoftwareInventory, RedfishError>,
-    > {
-        Box::pin(async move {
-            self.s
-                .get_firmware_for_component(componnent_integrity_id)
-                .await
-        })
-    }
-
-    fn get_component_ca_certificate<'a>(
-        &'a self,
-        url: &'a str,
-    ) -> crate::RedfishFuture<
-        'a,
-        Result<crate::model::component_integrity::CaCertificate, RedfishError>,
-    > {
-        Box::pin(async move { self.s.get_component_ca_certificate(url).await })
-    }
-
-    fn trigger_evidence_collection<'a>(
-        &'a self,
-        url: &'a str,
-        nonce: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<Task, RedfishError>> {
-        Box::pin(async move { self.s.trigger_evidence_collection(url, nonce).await })
-    }
-
-    fn get_evidence<'a>(
-        &'a self,
-        url: &'a str,
-    ) -> crate::RedfishFuture<'a, Result<crate::model::component_integrity::Evidence, RedfishError>>
-    {
-        Box::pin(async move { self.s.get_evidence(url).await })
-    }
-
-    fn set_host_privilege_level<'a>(
-        &'a self,
-        level: HostPrivilegeLevel,
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.set_host_privilege_level(level).await })
-    }
-
-    fn set_utc_timezone<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.set_utc_timezone().await })
-    }
-
-    fn set_ntp_servers<'a>(
-        &'a self,
-        servers: &'a [String],
-    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.set_manager_ntp_servers(servers).await })
     }
 }
 
@@ -1235,37 +744,29 @@ impl Bmc {
         Ok(diffs)
     }
 
-    async fn get_expected_and_actual_first_boot_option(
+    async fn boot_order_diff(
         &self,
         boot_interface_mac: &str,
-    ) -> Result<(Option<String>, Option<String>), RedfishError> {
+    ) -> Result<Option<MachineSetupDiff>, RedfishError> {
         // Try using standard BootOptions first
         match self.s.get_boot_options().await {
             Ok(all) => {
-                // Get actual first boot option
-                let actual_first_boot_option = if let Some(first) = all.members.first() {
-                    let id = first.odata_id_get()?;
-                    Some(self.s.get_boot_option(id).await?.display_name)
-                } else {
-                    None
-                };
-
-                // Find expected boot option
-                let mut expected_first_boot_option = None;
-                for b in &all.members {
-                    let id = b.odata_id_get()?;
-                    let boot_option = self.s.get_boot_option(id).await?;
-
-                    if (boot_option.display_name.contains(MELLANOX_UEFI_HTTP_IPV4)
-                        || boot_option.display_name.contains(NVIDIA_UEFI_HTTP_IPV4))
-                        && boot_option.display_name.contains(boot_interface_mac)
-                    {
-                        expected_first_boot_option = Some(boot_option.display_name);
-                        break;
-                    }
+                let system = self.s.get_system().await?;
+                if system.boot.boot_order.is_empty() {
+                    return self.load_fixed_boot_order_diff(boot_interface_mac).await;
                 }
 
-                Ok((expected_first_boot_option, actual_first_boot_option))
+                let mut boot_options = Vec::with_capacity(all.members.len());
+                for member in &all.members {
+                    let id = member.odata_id_get()?;
+                    boot_options.push(self.s.get_boot_option(id).await?);
+                }
+
+                Ok(standard_boot_order_diff(
+                    &system.boot.boot_order,
+                    &boot_options,
+                    boot_interface_mac,
+                ))
             }
             Err(RedfishError::HTTPErrorCode {
                 status_code,
@@ -1276,29 +777,22 @@ impl Bmc {
                 && response_body.contains("BootOrder") =>
             {
                 // Fall back to FixedBootOrder for platforms that don't support standard BootOptions
-                let fbo = self.get_boot_order().await?;
-
-                // Get actual first boot option (strip prefix like "UEFI Network:", "UEFI Hard Disk:", etc.)
-                let actual_first_boot_option = fbo.fixed_boot_order.first().and_then(|entry| {
-                    // Find the first colon and take everything after it
-                    entry.find(':').map(|idx| entry[idx + 1..].to_string())
-                });
-
-                // Find expected boot option in UEFINetwork list
-                let expected_first_boot_option = fbo
-                    .uefi_network
-                    .iter()
-                    .find(|entry| {
-                        (entry.contains(MELLANOX_UEFI_HTTP_IPV4)
-                            || entry.contains(NVIDIA_UEFI_HTTP_IPV4))
-                            && entry.contains(boot_interface_mac)
-                    })
-                    .cloned();
-
-                Ok((expected_first_boot_option, actual_first_boot_option))
+                self.load_fixed_boot_order_diff(boot_interface_mac).await
             }
             Err(e) => Err(e),
         }
+    }
+
+    async fn load_fixed_boot_order_diff(
+        &self,
+        boot_interface_mac: &str,
+    ) -> Result<Option<MachineSetupDiff>, RedfishError> {
+        let fbo = self.get_boot_order().await?;
+        Ok(fixed_boot_order_diff(
+            &fbo.fixed_boot_order,
+            &fbo.uefi_network,
+            boot_interface_mac,
+        ))
     }
 
     async fn machine_setup_attrs(&self) -> Result<Vec<(String, serde_json::Value)>, RedfishError> {
@@ -1307,7 +801,7 @@ impl Bmc {
 
         macro_rules! add_keys {
             ($name:literal, $value:expr) => {
-                for real_key in bios_keys.remove($name).unwrap_or(vec![]) {
+                for real_key in bios_keys.remove($name).unwrap_or_default() {
                     bios_attrs.push((real_key, $value.into()));
                 }
             };
@@ -1328,6 +822,7 @@ impl Bmc {
         add_keys!("IntelVTforDirectedI/O(VT-d)", EnableDisable::Enable);
         add_keys!("IntelVirtualizationTechnology", EnableDisable::Enable);
         add_keys!("SR-IOVSupport", EnabledDisabled::Enabled);
+        add_keys!("SR_IOVSupport", EnabledDisabled::Enabled);
 
         // UEFI NIC boot
         add_keys!("IPv4HTTPSupport", EnabledDisabled::Enabled);
@@ -1372,13 +867,16 @@ impl Bmc {
         Ok(bios_attrs)
     }
 
-    async fn get_kcs_privilege(&self) -> Result<supermicro::Privilege, RedfishError> {
+    async fn get_kcs_privilege(&self) -> Result<Option<supermicro::Privilege>, RedfishError> {
         if self.is_mgx_c2().await? {
+            if !self.bmc_supports_ipmi_host_iface().await? {
+                return Ok(None);
+            }
             let enabled = self.get_ipmi_host_interface_enabled().await?;
             return if enabled {
-                Ok(supermicro::Privilege::Administrator)
+                Ok(Some(supermicro::Privilege::Administrator))
             } else {
-                Ok(supermicro::Privilege::Callback)
+                Ok(Some(supermicro::Privilege::Callback))
             };
         }
 
@@ -1404,11 +902,14 @@ impl Bmc {
                 expected_type: "&str".to_string(),
                 url: url.to_string(),
             })?;
-        p_str.parse().map_err(|_| RedfishError::InvalidKeyType {
-            key: key.to_string(),
-            expected_type: "oem::supermicro::Privilege".to_string(),
-            url: url.to_string(),
-        })
+        p_str
+            .parse()
+            .map(Some)
+            .map_err(|_| RedfishError::InvalidKeyType {
+                key: key.to_string(),
+                expected_type: "oem::supermicro::Privilege".to_string(),
+                url: url.to_string(),
+            })
     }
 
     async fn set_kcs_privilege(
@@ -1416,6 +917,14 @@ impl Bmc {
         privilege: supermicro::Privilege,
     ) -> Result<(), RedfishError> {
         if self.is_mgx_c2().await? {
+            if !self.bmc_supports_ipmi_host_iface().await? {
+                tracing::warn!(
+                    smc_bmc_ip = self.s.client.host(),
+                    "MGX C2 BMC firmware is older than {MIN_BMC_FW_IPMI_HOST_IFACE}; \
+                     skipping IPMIHostInterface write"
+                );
+                return Ok(());
+            }
             let enabled = privilege == supermicro::Privilege::Administrator;
             return self.set_ipmi_host_interface(enabled).await;
         }
@@ -1441,18 +950,7 @@ impl Bmc {
 
     /// Disable/enable SSIF in-band access via `IPMIHostInterface` on `Systems/{id}`.
     /// Used for MGX C2 systems that lack the KCSInterface endpoint.
-    /// No-op when the BMC firmware is older than 01.05.01.
     async fn set_ipmi_host_interface(&self, enabled: bool) -> Result<(), RedfishError> {
-        if !self.bmc_supports_ipmi_host_iface().await? {
-            let smc_bmc_ip = self.s.client.host();
-            tracing::warn!(
-                smc_bmc_ip,
-                "MGX C2 BMC firmware is older than {MIN_BMC_FW_IPMI_HOST_IFACE}; \
-                 skipping IPMIHostInterface write"
-            );
-            return Ok(());
-        }
-
         use crate::model::system::IpmiHostInterface;
         let url = format!("Systems/{}", self.s.system_id());
         let body = HashMap::from([(
@@ -1466,18 +964,7 @@ impl Bmc {
 
     /// Get whether SSIF in-band access is enabled via `IPMIHostInterface` on `Systems/{id}`.
     /// Used for MGX C2 systems that lack the KCSInterface endpoint.
-    /// Returns `false` when the BMC firmware is older than 01.05.01.
     async fn get_ipmi_host_interface_enabled(&self) -> Result<bool, RedfishError> {
-        if !self.bmc_supports_ipmi_host_iface().await? {
-            let smc_bmc_ip = self.s.client.host();
-            tracing::warn!(
-                smc_bmc_ip,
-                "MGX C2 BMC firmware is older than {MIN_BMC_FW_IPMI_HOST_IFACE}; \
-                 IPMIHostInterface unavailable, reporting disabled"
-            );
-            return Ok(false);
-        }
-
         let system = self.s.get_system().await?;
         let iface = system
             .ipmi_host_interface
@@ -1612,10 +1099,11 @@ impl Bmc {
             let Some(pos) = fbo
                 .uefi_network
                 .iter()
-                .position(|s| s.contains("UEFI HTTP IPv4 Mellanox"))
+                .position(|entry| is_supported_uefi_http_boot_option(entry))
             else {
                 return Err(RedfishError::NotSupported(
-                    "No match for 'UEFI HTTP IPv4 Mellanox' in network boot order".to_string(),
+                    "No match for a Mellanox/NVIDIA UEFI HTTP IPv4 adapter in network boot order"
+                        .to_string(),
                 ));
             };
             fbo.uefi_network.swap(0, pos);
@@ -1645,45 +1133,55 @@ impl Bmc {
         Ok(body)
     }
 
-    /// Set the DPU to be our first netboot device.
+    /// Try to select the DPU through the standard Redfish boot order.
     ///
-    /// Callers should usually ignore the error and continue. The HTTP adapter
-    /// will only appear after IPv4HTTPSupport bios setting is enabled and the host rebooted.
-    /// If the Mellanox adapter is not first everything still works, but boot takes a little longer
-    /// because it tries the other adapters too.
-    async fn set_mellanox_first(&self, boot_interface: &str) -> Result<(), RedfishError> {
-        let mut with_name_match = None; // the ID of the option matching with_name
-        let mut ordered = Vec::new(); // the final boot options
+    /// An empty standard boot order selects the OEM fixed-order fallback.
+    async fn try_set_standard_boot_order_dpu_first(
+        &self,
+        boot_interface: &str,
+    ) -> Result<bool, RedfishError> {
+        let system = self.s.get_system().await?;
+        let Some(mut boot_order) = usable_standard_boot_order(system.boot.boot_order) else {
+            return Ok(false);
+        };
+
         let all = self.s.get_boot_options().await?;
+        let mut target_reference = None;
         for b in all.members {
             let id = b.odata_id_get()?;
             let boot_option = self.s.get_boot_option(id).await?;
 
-            if (boot_option.display_name.contains(MELLANOX_UEFI_HTTP_IPV4)
-                || boot_option.display_name.contains(NVIDIA_UEFI_HTTP_IPV4))
-                && boot_option.display_name.contains(boot_interface)
-            {
+            if http_boot_option_matches_mac(&boot_option.display_name, boot_interface) {
                 // Here are the patterns we have seen so far:
                 // UEFI HTTP IPv4 Mellanox Network Adapter - A0:88:C2:EA:84:D0(MAC:A088C2EA84D0)
                 // UEFI HTTP IPv4 Nvidia Network Adapter - C4:70:BD:F0:40:AA - C470BDF040AA"
-                with_name_match = Some(boot_option.id);
-            } else {
-                ordered.push(boot_option.id);
+                target_reference = Some(boot_option.boot_option_reference);
+                break;
             }
         }
-        if with_name_match.is_none() {
+        let Some(target_reference) = target_reference else {
             // This happens if IPv4HTTPSupport#00F7 is disabled in the bios
             return Err(RedfishError::NotSupported(
                 "No match for Mellanox HTTP adapter boot".to_string(),
             ));
+        };
+
+        if boot_order
+            .first()
+            .is_some_and(|entry| boot::boot_order_entry_reference(entry) == target_reference)
+        {
+            return Ok(true);
         }
-        ordered.insert(0, with_name_match.unwrap());
-        self.change_boot_order(ordered).await
+        if !boot::promote_boot_order_entry_first(&mut boot_order, &target_reference) {
+            boot_order.insert(0, target_reference);
+        }
+        self.change_boot_order(boot_order).await?;
+        Ok(true)
     }
 
-    // BIOS attribute names by their clean name.
-    // e.g.{ QuietBoot -> [QuietBoot#002E]
-    //       TXTSupport -> [TXTSupport#0062, TXTSupport#0072] }
+    // BIOS attribute names by their canonical name.
+    // e.g. QuietBoot -> [QuietBoot_002E]
+    //      TXTSupport -> [TXTSupport_0062, TXTSupport_0072]
     async fn bios_attributes_name_map(&self) -> Result<HashMap<String, Vec<String>>, RedfishError> {
         let bios_attrs = self.s.bios_attributes().await?;
 
@@ -1696,7 +1194,10 @@ impl Bmc {
         };
         let mut by_name: HashMap<String, Vec<String>> = HashMap::with_capacity(attrs_map.len());
         for k in attrs_map.keys() {
-            let clean_key = k.split('_').next().unwrap().to_string();
+            let clean_key = k
+                .rsplit_once('_')
+                .map_or(k.as_str(), |(name, _suffix)| name.trim_end_matches('_'))
+                .to_string();
             by_name
                 .entry(clean_key)
                 .and_modify(|e| e.push(k.clone()))
@@ -1706,13 +1207,22 @@ impl Bmc {
     }
 
     /// MGX C2 systems use SSIF instead of x86 KCS, so the KCSInterface
-    /// endpoint doesn't exist. Detect them by matching the system model.
+    /// endpoint doesn't exist. Detect them by the NVIDIA PG535
+    /// processor-module identity.
+    /// See: https://docs.nvidia.com/dccpu/grace-perf-tuning-guide/system.html
     async fn is_mgx_c2(&self) -> Result<bool, RedfishError> {
-        let model = self.s.get_system().await?.model.unwrap_or_default();
-        Ok(MGX_C2_MODELS.iter().any(|m| model.contains(m)))
+        let chassis = self
+            .s
+            .get_collection(ODataId {
+                odata_id: "/redfish/v1/Chassis".to_string(),
+            })
+            .await?
+            .try_get::<Chassis>()?;
+
+        Ok(chassis.members.iter().any(is_mgx_c2_processor_module))
     }
 
-    async fn is_grace_grace_smc(&self) -> Result<bool, RedfishError> {
+    async fn is_ars_121l_dnr(&self) -> Result<bool, RedfishError> {
         Ok(self
             .s
             .get_system()
@@ -1721,6 +1231,20 @@ impl Bmc {
             .unwrap_or_default()
             .contains("ARS-121L-DNR"))
     }
+}
+
+fn is_mgx_c2_processor_module(chassis: &Chassis) -> bool {
+    chassis
+        .manufacturer
+        .as_deref()
+        .is_some_and(|manufacturer| manufacturer.eq_ignore_ascii_case("NVIDIA"))
+        && (chassis
+            .model
+            .as_deref()
+            .is_some_and(|model| model.starts_with(MGX_C2_PROCESSOR_MODULE_MODEL_PREFIX))
+            || chassis.part_number.as_deref().is_some_and(|part_number| {
+                part_number.contains(MGX_C2_PROCESSOR_MODULE_PART_NUMBER_FRAGMENT)
+            }))
 }
 
 // UpdateParameters is what is sent for a multipart firmware upload's metadata.
@@ -1779,6 +1303,167 @@ impl UpdateParameters {
             targets: vec![target],
             apply_time: "Immediate".to_string(),
             oem,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn boot_option(reference: &str, display_name: &str) -> BootOption {
+        BootOption {
+            odata: Default::default(),
+            alias: None,
+            description: None,
+            boot_option_enabled: Some(true),
+            boot_option_reference: reference.to_string(),
+            display_name: display_name.to_string(),
+            id: reference.to_string(),
+            name: display_name.to_string(),
+            uefi_device_path: None,
+        }
+    }
+
+    #[test]
+    fn standard_boot_verification_uses_system_boot_order_not_collection_order() {
+        let target = format!("{NVIDIA_UEFI_HTTP_IPV4} - B8:E9:24:17:6D:72 (MAC:B8E924176D72)");
+        let disk = "UEFI Hard Disk";
+        let options = vec![
+            boot_option("Boot0001", &target),
+            boot_option("Boot0002", disk),
+        ];
+
+        let diff = standard_boot_order_diff(
+            &["Boot0002".to_string(), "Boot0001".to_string()],
+            &options,
+            "b8:e9:24:17:6d:72",
+        )
+        .expect("disk is first");
+
+        assert_eq!(diff.expected, target);
+        assert_eq!(diff.actual, disk);
+    }
+
+    #[test]
+    fn supported_uefi_http_boot_options_include_mellanox_and_nvidia_names() {
+        for display_name in [MELLANOX_UEFI_HTTP_IPV4, NVIDIA_UEFI_HTTP_IPV4] {
+            assert!(is_supported_uefi_http_boot_option(display_name));
+        }
+        assert!(!is_supported_uefi_http_boot_option(
+            "UEFI HTTP IPv4 Intel Network Adapter"
+        ));
+    }
+
+    #[test]
+    fn standard_boot_verification_resolves_decorated_boot_order_reference() {
+        let target = format!("{MELLANOX_UEFI_HTTP_IPV4} - B8:E9:24:17:6D:72 (MAC:B8E924176D72)");
+        let options = vec![
+            boot_option("Boot0002", "UEFI Hard Disk"),
+            boot_option("Boot0001", &target),
+        ];
+
+        let diff = standard_boot_order_diff(
+            &["Boot0001: Selected network adapter".to_string()],
+            &options,
+            "B8:E9:24:17:6D:72",
+        );
+
+        assert!(diff.is_none());
+    }
+
+    #[test]
+    fn standard_boot_verification_compares_references_not_display_names() {
+        let target = format!("{MELLANOX_UEFI_HTTP_IPV4} - B8:E9:24:17:6D:72 (MAC:B8E924176D72)");
+        let options = vec![
+            boot_option("Boot0001", &target),
+            boot_option("Boot0002", &target),
+        ];
+
+        let diff = standard_boot_order_diff(
+            &["Boot0002".to_string(), "Boot0001".to_string()],
+            &options,
+            "B8:E9:24:17:6D:72",
+        );
+
+        assert!(diff.is_some());
+    }
+
+    #[test]
+    fn fixed_boot_verification_resolves_network_category_and_prefixed_entry() {
+        let target = format!("{NVIDIA_UEFI_HTTP_IPV4} - B8:E9:24:17:6D:72 (MAC:B8E924176D72)");
+        let uefi_network = vec![target.clone()];
+
+        for fixed_order in [
+            vec![NETWORK.to_string()],
+            vec![format!("{NETWORK}:{target}")],
+        ] {
+            let diff = fixed_boot_order_diff(&fixed_order, &uefi_network, "b8:e9:24:17:6d:72");
+            assert!(diff.is_none(), "unexpected diff for {fixed_order:?}");
+        }
+    }
+
+    #[test]
+    fn empty_standard_boot_order_is_not_usable() {
+        assert!(usable_standard_boot_order(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn fixed_boot_verification_uses_selected_network_device_not_category_suffix() {
+        let target = format!("{NVIDIA_UEFI_HTTP_IPV4} - B8:E9:24:17:6D:72 (MAC:B8E924176D72)");
+        let other = format!("{NVIDIA_UEFI_HTTP_IPV4} - B8:E9:24:17:6D:73 (MAC:B8E924176D73)");
+
+        let diff = fixed_boot_order_diff(
+            &[format!("{NETWORK}:{other}")],
+            &[target.clone(), other.clone()],
+            "b8:e9:24:17:6d:72",
+        );
+        assert!(diff.is_none());
+
+        let diff = fixed_boot_order_diff(
+            &[format!("{NETWORK}:{target}")],
+            &[other.clone(), target],
+            "b8:e9:24:17:6d:72",
+        )
+        .expect("a different network device is selected");
+        assert_eq!(diff.actual, other);
+    }
+
+    #[test]
+    fn identifies_mgx_c2_processor_modules() {
+        let cases = [
+            ("PG535 model", Some("NVIDIA"), Some("PG535-B02"), None, true),
+            (
+                "2G535 part number",
+                Some("Nvidia"),
+                None,
+                Some("699-2G535-0200-310"),
+                true,
+            ),
+            (
+                "unrelated NVIDIA module",
+                Some("NVIDIA"),
+                Some("B4240"),
+                Some("900-9D3B4-00CC-EA0"),
+                false,
+            ),
+            (
+                "non-NVIDIA PG535",
+                Some("Supermicro"),
+                Some("PG535-B02"),
+                Some("699-2G535-0200-310"),
+                false,
+            ),
+        ];
+
+        for (case, manufacturer, model, part_number, expected) in cases {
+            let chassis = Chassis {
+                manufacturer: manufacturer.map(str::to_string),
+                model: model.map(str::to_string),
+                part_number: part_number.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(is_mgx_c2_processor_module(&chassis), expected, "{case}");
         }
     }
 }

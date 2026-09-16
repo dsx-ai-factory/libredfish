@@ -104,6 +104,18 @@ impl fmt::Display for BootSourceOverrideTarget {
     }
 }
 
+/// Maps the simple [`crate::Boot`] enum used by `boot_once` / `boot_first`
+/// to the richer `BootSourceOverrideTarget` consumed by `set_boot_override`.
+impl From<crate::Boot> for BootSourceOverrideTarget {
+    fn from(target: crate::Boot) -> Self {
+        match target {
+            crate::Boot::Pxe => BootSourceOverrideTarget::Pxe,
+            crate::Boot::HardDisk => BootSourceOverrideTarget::Hdd,
+            crate::Boot::UefiHttp => BootSourceOverrideTarget::UefiHttp,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum BootSourceOverrideMode {
@@ -144,4 +156,35 @@ impl std::fmt::Display for TrustedModuleRequiredToBoot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, f)
     }
+}
+
+/// Returns the boot option reference embedded in a `BootOrder` entry.
+///
+/// Some BMC firmware reports entries like `Boot0019: Ubuntu` while BootOption
+/// GET URLs use the reference prefix (`Boot0019`).
+pub fn boot_order_entry_reference(entry: &str) -> &str {
+    entry
+        .split_once(": ")
+        .map_or(entry, |(reference, _)| reference)
+}
+
+/// Moves the entry for `target_reference` to the front of `boot_order` while
+/// preserving the exact string reported by the BMC.
+///
+/// Returns `false` when the reference is not present.
+pub fn promote_boot_order_entry_first(
+    boot_order: &mut Vec<String>,
+    target_reference: &str,
+) -> bool {
+    let Some(target_index) = boot_order
+        .iter()
+        .position(|entry| boot_order_entry_reference(entry) == target_reference)
+    else {
+        return false;
+    };
+
+    let target_entry = boot_order.remove(target_index);
+    boot_order.retain(|entry| boot_order_entry_reference(entry) != target_reference);
+    boot_order.insert(0, target_entry);
+    true
 }
