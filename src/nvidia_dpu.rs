@@ -45,7 +45,7 @@ use crate::{
         BootOption,
     },
     standard::RedfishStandard,
-    BiosProfileType, NetworkDeviceFunction, Redfish, RedfishError,
+    BiosProfileType, Chassis, NetworkDeviceFunction, Redfish, RedfishError, SystemPowerControl,
 };
 use crate::{EnabledDisabled, MachineSetupDiff, MachineSetupStatus};
 
@@ -72,7 +72,48 @@ impl Bmc {
     pub fn new(s: RedfishStandard) -> Result<Bmc, RedfishError> {
         Ok(Bmc { s })
     }
+
+    async fn try_force_dpu_reset(&self) -> Result<bool, RedfishError> {
+        let chassis_ids = self.s.get_members("Chassis").await?;
+        let Some(chassis_id) = matching_chassis_id(self.s.system_id(), &chassis_ids) else {
+            return Ok(false);
+        };
+
+        let url = format!("Chassis/{chassis_id}");
+        let (_, chassis): (_, Chassis) = self.s.client.get(&url).await?;
+        let Some(target) = nvidia_force_dpu_reset_target(&chassis) else {
+            return Ok(false);
+        };
+        let target = target
+            .strip_prefix(&format!("/{}/", crate::REDFISH_ENDPOINT))
+            .unwrap_or(target);
+        let data = HashMap::from([("ResetType", "ForceDpuReset")]);
+        match self.s.client.post(target, data).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.not_found() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
 }
+
+fn matching_chassis_id<'a>(system_id: &str, chassis_ids: &'a [String]) -> Option<&'a str> {
+    chassis_ids.iter().find_map(|chassis_id| {
+        (chassis_id.rsplit('/').next() == Some(system_id)).then_some(chassis_id.as_str())
+    })
+}
+
+fn nvidia_force_dpu_reset_target(chassis: &Chassis) -> Option<&str> {
+    chassis
+        .actions
+        .as_ref()?
+        .oem
+        .as_ref()?
+        .reset
+        .as_ref()?
+        .target
+        .as_deref()
+}
+
 impl Redfish for Bmc {
     fn std_redfish(&self) -> &RedfishStandard {
         &self.s
@@ -88,6 +129,19 @@ impl Redfish for Bmc {
 
     fn ac_powercycle_supported_by_power(&self) -> bool {
         false
+    }
+
+    fn power<'a>(
+        &'a self,
+        action: SystemPowerControl,
+    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
+        Box::pin(async move {
+            if action == SystemPowerControl::ForceRestart && self.try_force_dpu_reset().await? {
+                return Ok(());
+            }
+
+            self.s.power(action).await
+        })
     }
 
     fn get_thermal_metrics<'a>(
@@ -907,5 +961,63 @@ impl Bmc {
         let url = format!("Systems/{}/Oem/Nvidia/Actions/Mode.Set", self.s.system_id());
 
         self.s.client.post(&url, data).await.map(|_resp| Ok(()))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn matching_chassis_requires_the_system_id() {
+        let cases = [
+            (
+                "matching BlueField-4 chassis",
+                "BlueField_0",
+                vec!["BMC_0".to_string(), "BlueField_0".to_string()],
+                Some("BlueField_0"),
+            ),
+            (
+                "BlueField-3 chassis uses a different id",
+                "Bluefield",
+                vec!["Bluefield_BMC".to_string(), "Card1".to_string()],
+                None,
+            ),
+        ];
+
+        for (name, system_id, chassis_ids, expected) in cases {
+            assert_eq!(
+                matching_chassis_id(system_id, &chassis_ids),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn nvidia_force_dpu_reset_requires_an_advertised_target() {
+        let cases = [
+            (
+                "advertised action",
+                json!({
+                    "Actions": {
+                        "Oem": {
+                            "#NvidiaChassis.Reset": {
+                                "target": "/redfish/v1/Chassis/BlueField_0/Actions/Oem/NvidiaChassis.Reset"
+                            }
+                        }
+                    }
+                }),
+                Some("/redfish/v1/Chassis/BlueField_0/Actions/Oem/NvidiaChassis.Reset"),
+            ),
+            ("missing OEM action", json!({ "Actions": {} }), None),
+        ];
+
+        for (name, payload, expected) in cases {
+            let chassis: Chassis = serde_json::from_value(payload).expect(name);
+            assert_eq!(nvidia_force_dpu_reset_target(&chassis), expected, "{name}");
+        }
     }
 }

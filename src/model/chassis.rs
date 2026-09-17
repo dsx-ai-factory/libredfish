@@ -38,6 +38,8 @@ use crate::RedfishError;
 pub struct ChassisActions {
     #[serde(rename = "#Chassis.Reset")]
     pub chassis_reset: Option<ChassisAction>,
+    #[serde(rename = "Oem")]
+    pub oem: Option<super::oem::nvidia_openbmc::ChassisOemActions>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
