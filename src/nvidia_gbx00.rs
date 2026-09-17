@@ -127,6 +127,127 @@ impl Display for BootOptionMatchField {
     }
 }
 
+#[derive(Debug)]
+struct BootOrderStatus {
+    expected_first: Option<String>,
+    actual_first: Option<String>,
+    expected_second: Option<String>,
+    actual_second: Option<String>,
+}
+
+impl BootOrderStatus {
+    fn is_setup(&self) -> bool {
+        self.expected_first.is_some()
+            && self.expected_first == self.actual_first
+            && (self.expected_second.is_none() || self.expected_second == self.actual_second)
+    }
+}
+
+fn boot_option_matches(option: &BootOption, name: &str, match_field: BootOptionMatchField) -> bool {
+    match match_field {
+        BootOptionMatchField::DisplayName => option.display_name.starts_with(name),
+        BootOptionMatchField::UefiDevicePath => option
+            .uefi_device_path
+            .as_deref()
+            .is_some_and(|path| path.starts_with(name)),
+    }
+}
+
+fn boot_option_for_order_entry<'a>(
+    boot_options: &'a [BootOption],
+    entry: &str,
+) -> Option<&'a BootOption> {
+    let reference = crate::model::boot::boot_order_entry_reference(entry);
+    boot_options
+        .iter()
+        .find(|option| option.boot_option_reference == reference)
+}
+
+fn boot_order_status(
+    boot_order: &[String],
+    boot_options: &[BootOption],
+    boot_interface_mac: &str,
+) -> BootOrderStatus {
+    let mac_address = boot_interface_mac.replace(':', "").to_uppercase();
+    let http_name = format!("{} (MAC:{})", BootOptionName::Http.to_string(), mac_address);
+
+    let expected_first = boot_options
+        .iter()
+        .find(|option| option.display_name.starts_with(&http_name))
+        .map(|option| option.display_name.clone());
+    let actual_first = boot_order
+        .first()
+        .and_then(|entry| boot_option_for_order_entry(boot_options, entry))
+        .map(|option| option.display_name.clone());
+
+    let expected_second = boot_options
+        .iter()
+        .find(|option| {
+            boot_option_matches(
+                option,
+                BootOptionName::Hdd.to_string(),
+                BootOptionMatchField::UefiDevicePath,
+            )
+        })
+        .map(|option| option.display_name.clone());
+    let actual_second = boot_order
+        .get(1)
+        .and_then(|entry| boot_option_for_order_entry(boot_options, entry))
+        .map(|option| option.display_name.clone());
+
+    BootOrderStatus {
+        expected_first,
+        actual_first,
+        expected_second,
+        actual_second,
+    }
+}
+
+fn promote_or_insert_boot_option(boot_order: &mut Vec<String>, reference: &str) {
+    if !crate::model::boot::promote_boot_order_entry_first(boot_order, reference) {
+        boot_order.insert(0, reference.to_string());
+    }
+}
+
+fn reorder_boot_options(
+    mut boot_order: Vec<String>,
+    boot_options: &[BootOption],
+    first_name: &str,
+    first_match_field: BootOptionMatchField,
+    second: Option<(&str, BootOptionMatchField)>,
+) -> Result<Vec<String>, RedfishError> {
+    let first = boot_options
+        .iter()
+        .find(|option| boot_option_matches(option, first_name, first_match_field))
+        .ok_or_else(|| {
+            let all_names: Vec<_> = boot_options
+                .iter()
+                .map(|option| format!("{}: {}", option.id, option.display_name))
+                .collect();
+            RedfishError::GenericError {
+                error: format!(
+                    "Could not find boot option matching {first_name} on {}; all boot options: {all_names:#?}",
+                    first_match_field
+                ),
+            }
+        })?;
+
+    // Promote the second entry first so promoting the selected network entry
+    // leaves the disk immediately behind it. A disk entry may not exist yet
+    // during initial ingestion, before an OS bootloader has been installed.
+    if let Some((second_name, second_match_field)) = second {
+        if let Some(second) = boot_options
+            .iter()
+            .find(|option| boot_option_matches(option, second_name, second_match_field))
+        {
+            promote_or_insert_boot_option(&mut boot_order, &second.boot_option_reference);
+        }
+    }
+    promote_or_insert_boot_option(&mut boot_order, &first.boot_option_reference);
+
+    Ok(boot_order)
+}
+
 // Supported component to firmware mapping.
 // GPU, Source: HGX_IRoT_GPU_X Target: HGX_FW_GPU_X
 fn get_component_integrity_id_to_firmware_inventory_id_options(
@@ -500,15 +621,29 @@ impl Redfish for Bmc {
             // Check BIOS and BMC attributes
             let mut diffs = self.diff_bios_bmc_attr().await?;
 
-            // Check the first boot option
+            // Check the first network boot option and disk fallback.
             if let Some(mac) = boot_interface_mac {
-                let (expected, actual) =
-                    self.get_expected_and_actual_first_boot_option(mac).await?;
-                if expected.is_none() || expected != actual {
+                let status = self.get_boot_order_status(mac).await?;
+                if status.expected_first.is_none() || status.expected_first != status.actual_first {
                     diffs.push(MachineSetupDiff {
                         key: "boot_first".to_string(),
-                        expected: expected.unwrap_or_else(|| "Not found".to_string()),
-                        actual: actual.unwrap_or_else(|| "Not found".to_string()),
+                        expected: status
+                            .expected_first
+                            .unwrap_or_else(|| "Not found".to_string()),
+                        actual: status
+                            .actual_first
+                            .unwrap_or_else(|| "Not found".to_string()),
+                    });
+                }
+                if status.expected_second.is_some()
+                    && status.expected_second != status.actual_second
+                {
+                    diffs.push(MachineSetupDiff {
+                        key: "boot_second".to_string(),
+                        expected: status.expected_second.unwrap_or_default(),
+                        actual: status
+                            .actual_second
+                            .unwrap_or_else(|| "Not found".to_string()),
                     });
                 }
             }
@@ -599,6 +734,7 @@ impl Redfish for Bmc {
                         .get_boot_options_ids_with_first(
                             BootOptionName::Hdd,
                             BootOptionMatchField::UefiDevicePath,
+                            None,
                             None,
                         )
                         .await?;
@@ -830,6 +966,7 @@ impl Redfish for Bmc {
                     BootOptionName::Http,
                     BootOptionMatchField::DisplayName,
                     Some(&boot_option_name),
+                    Some((BootOptionName::Hdd, BootOptionMatchField::UefiDevicePath)),
                 )
                 .await?;
             self.change_boot_order(boot_array).await?;
@@ -878,8 +1015,7 @@ impl Redfish for Bmc {
     ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
         Box::pin(async move {
             let mac = crate::resolve_boot_interface_mac(self, boot_interface).await?;
-            let (expected, actual) = self.get_expected_and_actual_first_boot_option(&mac).await?;
-            Ok(expected.is_some() && expected == actual)
+            Ok(self.get_boot_order_status(&mac).await?.is_setup())
         })
     }
 
@@ -975,40 +1111,37 @@ impl Bmc {
         Ok(diffs)
     }
 
-    async fn get_expected_and_actual_first_boot_option(
+    async fn get_boot_order_status(
         &self,
         boot_interface_mac: &str,
-    ) -> Result<(Option<String>, Option<String>), RedfishError> {
-        let mac_address = boot_interface_mac.replace(':', "").to_uppercase();
-        let boot_option_name =
-            format!("{} (MAC:{})", BootOptionName::Http.to_string(), mac_address);
+    ) -> Result<BootOrderStatus, RedfishError> {
+        let system = self.s.get_system().await?;
+        let boot_options_id =
+            system
+                .boot
+                .boot_options
+                .clone()
+                .ok_or_else(|| RedfishError::MissingKey {
+                    key: "boot.boot_options".to_string(),
+                    url: system.odata.odata_id.clone(),
+                })?;
+        let all_boot_options = self
+            .get_collection(boot_options_id)
+            .await?
+            .try_get::<BootOption>()?
+            .members;
 
-        let boot_options = self.s.get_system().await?.boot.boot_order;
-
-        // Get actual first boot option
-        let actual_first_boot_option = if let Some(first) = boot_options.first() {
-            Some(self.s.get_boot_option(first.as_str()).await?.display_name)
-        } else {
-            None
-        };
-
-        // Find expected boot option
-        let mut expected_first_boot_option = None;
-        for member in &boot_options {
-            let b = self.s.get_boot_option(member.as_str()).await?;
-            if b.display_name.starts_with(&boot_option_name) {
-                expected_first_boot_option = Some(b.display_name);
-                break;
-            }
-        }
-
-        Ok((expected_first_boot_option, actual_first_boot_option))
+        Ok(boot_order_status(
+            &system.boot.boot_order,
+            &all_boot_options,
+            boot_interface_mac,
+        ))
     }
 
     // name: The name of the device you want to make the first boot choice.
     async fn set_boot_order(&self, name: BootOptionName) -> Result<(), RedfishError> {
         let boot_array = self
-            .get_boot_options_ids_with_first(name, BootOptionMatchField::DisplayName, None)
+            .get_boot_options_ids_with_first(name, BootOptionMatchField::DisplayName, None, None)
             .await?;
         self.change_boot_order(boot_array).await
     }
@@ -1020,6 +1153,7 @@ impl Bmc {
         with_name: BootOptionName,
         match_field: BootOptionMatchField,
         with_name_str: Option<&str>,
+        second: Option<(BootOptionName, BootOptionMatchField)>,
     ) -> Result<Vec<String>, RedfishError> {
         let name_str = with_name_str.unwrap_or(with_name.to_string());
         let system = self.s.get_system().await?;
@@ -1040,35 +1174,14 @@ impl Bmc {
             .and_then(|c| c.try_get::<BootOption>())?
             .members;
 
-        // Search through all boot options to find the one we want
-        let found_boot_option = all_boot_options.iter().find(|b| match match_field {
-            BootOptionMatchField::DisplayName => b.display_name.starts_with(name_str),
-            BootOptionMatchField::UefiDevicePath => {
-                matches!(&b.uefi_device_path, Some(x) if x.starts_with(name_str))
-            }
-        });
-
-        let Some(target) = found_boot_option else {
-            let all_names: Vec<_> = all_boot_options
-                .iter()
-                .map(|b| format!("{}: {}", b.id, b.display_name))
-                .collect();
-            return Err(RedfishError::GenericError {
-                error: format!(
-                    "Could not find boot option matching {name_str} on {}; all boot options: {:#?}",
-                    match_field, all_names
-                ),
-            });
-        };
-
-        let target_id = target.id.clone();
-
-        // Prepend the found option to the front of the existing boot order
-        let mut ordered = system.boot.boot_order;
-        ordered.retain(|id| id != &target_id);
-        ordered.insert(0, target_id);
-
-        Ok(ordered)
+        let second = second.map(|(name, field)| (name.to_string(), field));
+        reorder_boot_options(
+            system.boot.boot_order,
+            &all_boot_options,
+            name_str,
+            match_field,
+            second,
+        )
     }
 
     async fn get_system_event_log(&self) -> Result<Vec<LogEntry>, RedfishError> {
@@ -1177,6 +1290,112 @@ impl UpdateParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn boot_option(
+        reference: &str,
+        display_name: &str,
+        uefi_device_path: Option<&str>,
+    ) -> BootOption {
+        BootOption {
+            odata: Default::default(),
+            alias: None,
+            description: None,
+            boot_option_enabled: Some(true),
+            boot_option_reference: reference.to_string(),
+            display_name: display_name.to_string(),
+            id: reference.to_string(),
+            name: display_name.to_string(),
+            uefi_device_path: uefi_device_path.map(str::to_string),
+        }
+    }
+
+    fn gb300_boot_options() -> Vec<BootOption> {
+        vec![
+            boot_option(
+                "Boot0028",
+                "UEFI HTTPv4 (MAC:AABBCCDDEEFF)",
+                Some("MAC(AABBCCDDEEFF)/IPv4(0.0.0.0)"),
+            ),
+            boot_option(
+                "Boot0002",
+                "ubuntu",
+                Some("HD(1,GPT,ABC,0x1000,0x100000)/\\\\EFI\\\\ubuntu\\\\shimaa64.efi"),
+            ),
+            boot_option(
+                "Boot0019",
+                "UEFI PXEv4 (MAC:A4A64EA674A4)",
+                Some("MAC(A4A64EA674A4)/IPv4(0.0.0.0)"),
+            ),
+            boot_option("Boot0001", "UEFI: Built-in EFI Shell", None),
+        ]
+    }
+
+    #[test]
+    fn dpu_boot_order_puts_disk_second_and_preserves_remaining_entries() {
+        let options = gb300_boot_options();
+        let order = vec![
+            "Boot0019: other network".to_string(),
+            "Boot0001".to_string(),
+            "Boot0028: selected HTTP".to_string(),
+            "Boot0002: ubuntu".to_string(),
+        ];
+
+        let reordered = reorder_boot_options(
+            order,
+            &options,
+            "UEFI HTTPv4 (MAC:AABBCCDDEEFF)",
+            BootOptionMatchField::DisplayName,
+            Some(("HD(", BootOptionMatchField::UefiDevicePath)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reordered,
+            vec![
+                "Boot0028: selected HTTP",
+                "Boot0002: ubuntu",
+                "Boot0019: other network",
+                "Boot0001",
+            ]
+        );
+    }
+
+    #[test]
+    fn dpu_boot_order_allows_disk_to_be_absent_during_ingestion() {
+        let mut options = gb300_boot_options();
+        options.retain(|option| option.boot_option_reference != "Boot0002");
+        let order = vec!["Boot0019".to_string(), "Boot0028".to_string()];
+
+        let reordered = reorder_boot_options(
+            order,
+            &options,
+            "UEFI HTTPv4 (MAC:AABBCCDDEEFF)",
+            BootOptionMatchField::DisplayName,
+            Some(("HD(", BootOptionMatchField::UefiDevicePath)),
+        )
+        .unwrap();
+
+        assert_eq!(reordered, vec!["Boot0028", "Boot0019"]);
+        assert!(boot_order_status(&reordered, &options, "AA:BB:CC:DD:EE:FF").is_setup());
+    }
+
+    #[test]
+    fn boot_order_status_requires_an_available_disk_to_be_second() {
+        let options = gb300_boot_options();
+        let wrong_order = vec![
+            "Boot0028".to_string(),
+            "Boot0019".to_string(),
+            "Boot0002".to_string(),
+        ];
+        let correct_order = vec![
+            "Boot0028".to_string(),
+            "Boot0002".to_string(),
+            "Boot0019".to_string(),
+        ];
+
+        assert!(!boot_order_status(&wrong_order, &options, "AA:BB:CC:DD:EE:FF").is_setup());
+        assert!(boot_order_status(&correct_order, &options, "AA:BB:CC:DD:EE:FF").is_setup());
+    }
 
     #[test]
     fn gb300_machine_setup_uses_vendor_specific_bios_attributes() {
