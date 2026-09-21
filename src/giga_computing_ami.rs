@@ -31,6 +31,11 @@ use crate::{
 /// AMI uses BIOS attribute SETUP001 for Administrator Password (UEFI password)
 const UEFI_PASSWORD_NAME: &str = "SETUP001";
 
+/// Giga Computing exposes infinite boot as the vendor-coded BIOS attribute
+/// GBT0183 ("Endless Retry Boot", MenuPath ./Boot) instead of AMI's generic
+/// "EndlessBoot", which this BIOS does not define.
+const INFINITE_BOOT_NAME: &str = "GBT0183";
+
 pub struct Bmc {
     s: RedfishStandard,
 }
@@ -957,7 +962,7 @@ impl Redfish for Bmc {
     fn enable_infinite_boot<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
             self.set_bios(HashMap::from([(
-                "EndlessBoot".to_string(),
+                INFINITE_BOOT_NAME.to_string(),
                 "Enabled".into(),
             )]))
             .await
@@ -971,7 +976,11 @@ impl Redfish for Bmc {
             let bios = self.s.bios().await?;
             let url = format!("Systems/{}/Bios", self.s.system_id());
             let attrs = jsonmap::get_object(&bios, "Attributes", &url)?;
-            let endless_boot = jsonmap::get_str(attrs, "EndlessBoot", "Bios Attributes")?;
+            // Absent on BIOS revisions that don't define it; report unknown
+            // rather than failing the whole readout.
+            let Some(endless_boot) = attrs.get(INFINITE_BOOT_NAME).and_then(|v| v.as_str()) else {
+                return Ok(None);
+            };
             Ok(Some(endless_boot == "Enabled"))
         })
     }
@@ -1209,7 +1218,7 @@ impl Bmc {
     // Dropped vs. ami::machine_setup_attrs (keys absent on Giga Computing R263-ZG0):
     //   LEM0001     — PXE retry count; no LEM* keys on this BMC
     //   FBO001      — Boot Mode Select; platform appears UEFI-only (only FBO201–205 UEFI entries exist)
-    //   EndlessBoot — Infinite Boot; not exposed
+    //   EndlessBoot — Infinite Boot; spelled GBT0183 on this BIOS (see INFINITE_BOOT_NAME)
     fn machine_setup_attrs(&self) -> HashMap<String, serde_json::Value> {
         HashMap::from([
             ("CPU005".to_string(), "Enabled".into()), // Enable/disable CPU Virtualization
@@ -1219,6 +1228,7 @@ impl Bmc {
             ("NWSK006".to_string(), "Enabled".into()), // IPv4 HTTP Support
             ("NWSK002".to_string(), "Disabled".into()), // IPv6 PXE Support
             ("NWSK007".to_string(), "Disabled".into()), // IPv6 HTTP Support
+            (INFINITE_BOOT_NAME.to_string(), "Enabled".into()), // Infinite Boot
         ])
     }
 
