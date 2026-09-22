@@ -179,13 +179,28 @@ impl Redfish for Bmc {
         Box::pin(async move { self.s.get_accounts().await })
     }
 
+    /// Giga/AMI pre-populates the account collection with fixed empty slots, so
+    /// a POST fills a slot rather than creating a row - and the slot keeps its
+    /// `Enabled=false`. The shared `create_user` sends only
+    /// UserName/Password/RoleId, which leaves the caller with an account that
+    /// exists, reports no error, and rejects every password. Send `Enabled`
+    /// explicitly so the account is usable when this returns.
     fn create_user<'a>(
         &'a self,
         username: &'a str,
         password: &'a str,
         role_id: RoleId,
     ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.s.create_user(username, password, role_id).await })
+        Box::pin(async move {
+            let data = HashMap::from([
+                ("UserName", serde_json::json!(username)),
+                ("Password", serde_json::json!(password)),
+                ("RoleId", serde_json::json!(role_id.to_string())),
+                ("Enabled", serde_json::json!(true)),
+            ]);
+            self.s.client.post("AccountService/Accounts", data).await?;
+            Ok(())
+        })
     }
 
     fn delete_user<'a>(

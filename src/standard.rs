@@ -1475,7 +1475,7 @@ impl RedfishStandard {
                 .as_deref()
                 .map(|m| m.eq_ignore_ascii_case("Giga Computing"))
                 .unwrap_or(false),
-            Err(e) => false,
+            Err(_) => false,
         }
     }
 
