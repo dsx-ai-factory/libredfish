@@ -168,7 +168,12 @@ impl Redfish for RedfishStandard {
             // AMI BMC requires If-Match header for PATCH requests
             if matches!(
                 service_root.vendor(),
-                Some(RedfishVendor::AMI | RedfishVendor::LenovoAMI | RedfishVendor::LenovoGB300)
+                Some(
+                    RedfishVendor::AMI
+                        | RedfishVendor::LenovoAMI
+                        | RedfishVendor::LenovoGB300
+                        | RedfishVendor::GigaComputingAMI
+                )
             ) {
                 self.client.patch_with_if_match(&url, &data).await
             } else {
