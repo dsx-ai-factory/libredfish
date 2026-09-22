@@ -7,7 +7,7 @@ use crate::{
     model::{
         account_service::ManagerAccount,
         boot::{
-            BootOverride, BootSourceOverrideEnabled, BootSourceOverrideMode,
+            self, BootOverride, BootSourceOverrideEnabled, BootSourceOverrideMode,
             BootSourceOverrideTarget,
         },
         certificate::Certificate,
@@ -1011,15 +1011,19 @@ impl Redfish for Bmc {
             let target_id = target.boot_option_reference.clone();
             let mut boot_order = system.boot.boot_order;
 
-            if boot_order.first() == Some(&target_id) {
+            let boot_order_is_set = boot_order
+                .first()
+                .is_some_and(|entry| boot::boot_order_entry_reference(entry) == target_id);
+            if boot_order_is_set {
                 tracing::info!(
                     "NO-OP: DPU ({mac_address}) is already first in boot order ({target_id})"
                 );
                 return Ok(None);
             }
 
-            boot_order.retain(|id| id != &target_id);
-            boot_order.insert(0, target_id);
+            if !boot::promote_boot_order_entry_first(&mut boot_order, &target_id) {
+                boot_order.insert(0, target_id);
+            }
             self.change_boot_order(boot_order).await?;
             Ok(None)
         })
@@ -1328,12 +1332,16 @@ impl Bmc {
 
         let mut boot_order = system.boot.boot_order;
 
-        if boot_order.first() == Some(&target_ref) {
+        if boot_order
+            .first()
+            .is_some_and(|entry| boot::boot_order_entry_reference(entry) == target_ref)
+        {
             return Ok(());
         }
 
-        boot_order.retain(|id| id != &target_ref);
-        boot_order.insert(0, target_ref);
+        if !boot::promote_boot_order_entry_first(&mut boot_order, &target_ref) {
+            boot_order.insert(0, target_ref);
+        }
         self.change_boot_order(boot_order).await
     }
 
@@ -1358,10 +1366,11 @@ impl Bmc {
             })
             .map(|opt| opt.display_name.clone());
 
-        let actual_first_boot_option = system.boot.boot_order.first().and_then(|first_ref| {
+        let actual_first_boot_option = system.boot.boot_order.first().and_then(|first_entry| {
+            let first_ref = boot::boot_order_entry_reference(first_entry);
             all_boot_options
                 .iter()
-                .find(|opt| &opt.boot_option_reference == first_ref)
+                .find(|opt| opt.boot_option_reference == first_ref)
                 .map(|opt| opt.display_name.clone())
         });
 
