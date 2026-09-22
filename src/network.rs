@@ -40,11 +40,6 @@ pub const REDFISH_ENDPOINT: &str = "redfish/v1";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const MIN_UPLOAD_BANDWIDTH: u64 = 10_000;
-// Some BMCs transiently respond with 403 Forbidden (e.g. while the web service
-// is still starting up), so retry a few times before giving up.
-// TEMPORARILY UNUSED: the 403 retry in `req` is commented out.
-#[allow(dead_code)]
-const FORBIDDEN_RETRY_DELAY: Duration = Duration::from_secs(8);
 
 pub struct RedfishClientPoolBuilder {
     connect_timeout: Duration,
@@ -697,25 +692,6 @@ impl RedfishHttpClient {
                             .await
                     }
                 }
-                // TEMPORARILY DISABLED: checking whether the transient 403 issue is
-                // fixed on the BMC side after the redfish update. Restore if it recurs.
-                // Some BMCs transiently respond with 403 Forbidden (e.g. while the web
-                // service is still starting up). Retry up to 3 times, 8 seconds apart.
-                // Err(err) if is_forbidden(&err) => {
-                //     tokio::time::sleep(FORBIDDEN_RETRY_DELAY).await;
-                //     let mut res = self
-                //         ._req(&method, api, &body, override_timeout, None, &custom_headers)
-                //         .await;
-                //
-                //     if matches!(&res, Err(e) if is_forbidden(e)) {
-                //         tokio::time::sleep(FORBIDDEN_RETRY_DELAY).await;
-                //         res = self
-                //             ._req(&method, api, &body, override_timeout, None, &custom_headers)
-                //             .await;
-                //     }
-                //
-                //     res
-                // }
                 Err(err) => Err(err),
             }
         }
@@ -1052,13 +1028,6 @@ fn system_ids_for_bios_probe<'a>(
 
 fn truncate(s: &str, len: usize) -> &str {
     &s[..len.min(s.len())]
-}
-
-/// Returns `true` if the error is an HTTP 403 Forbidden response.
-// TEMPORARILY UNUSED: the 403 retry in `req` is commented out.
-#[allow(dead_code)]
-fn is_forbidden(err: &RedfishError) -> bool {
-    matches!(err, RedfishError::HTTPErrorCode { status_code, .. } if *status_code == StatusCode::FORBIDDEN)
 }
 
 /// Redacts known sensitive JSON fields for safe logging.
