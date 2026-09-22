@@ -1,5 +1,7 @@
 use std::{collections::HashMap, path::Path, time::Duration};
 
+use serde::Deserialize;
+
 use crate::{
     jsonmap,
     model::{
@@ -35,6 +37,93 @@ const UEFI_PASSWORD_NAME: &str = "SETUP001";
 /// GBT0183 ("Endless Retry Boot", MenuPath ./Boot) instead of AMI's generic
 /// "EndlessBoot", which this BIOS does not define.
 const INFINITE_BOOT_NAME: &str = "GBT0183";
+
+/// Giga Computing R263-ZG0 exposes exactly one host interface, at a fixed path.
+const HOST_INTERFACE_URL: &str = "Managers/Self/HostInterfaces/Self";
+
+/// `AuthenticationModes` value that lets the host talk to the BMC with no
+/// credentials at all, as whatever role `AuthNoneRoleId` names (on this BMC:
+/// `HostInterfaceAdministrator`). Removing it closes the unauthenticated path.
+const AUTH_NONE: &str = "AuthNone";
+
+/// What `AuthenticationModes` becomes under lockdown: session auth only, so the
+/// host has to present real credentials.
+const AUTH_SESSION: &str = "RedfishSessionAuth";
+
+/// The subset of `HostInterface.v1_3_0` that decides whether the host can reach
+/// the BMC without credentials.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct HostInterface {
+    interface_enabled: Option<bool>,
+    authentication_modes: Option<Vec<String>>,
+    credential_bootstrapping: Option<CredentialBootstrapping>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CredentialBootstrapping {
+    enabled: Option<bool>,
+}
+
+impl HostInterface {
+    /// An absent field reads as open. A firmware that doesn't report one must
+    /// not be mistaken for a locked-down machine.
+    fn interface_enabled(&self) -> bool {
+        self.interface_enabled.unwrap_or(true)
+    }
+
+    fn auth_none_allowed(&self) -> bool {
+        self.authentication_modes
+            .as_ref()
+            .is_none_or(|modes| modes.iter().any(|m| m == AUTH_NONE))
+    }
+
+    fn credential_bootstrapping_enabled(&self) -> bool {
+        self.credential_bootstrapping
+            .as_ref()
+            .and_then(|cb| cb.enabled)
+            .unwrap_or(true)
+    }
+}
+
+/// Verdict over the host→BMC paths this BMC exposes over Redfish.
+///
+/// Two of them let the host in with no prior credentials, and they are
+/// independent — closing one leaves the other open:
+///
+///   * `AuthNone` on an enabled interface: unauthenticated requests over the
+///     USB NIC are served as `HostInterfaceAdministrator`.
+///   * `CredentialBootstrapping`: the host asks the BMC to mint a real
+///     username/password with that same admin role. Per DSP0270 the host
+///     fetches these over IPMI/KCS, so disabling the USB NIC does not
+///     necessarily close this one.
+///
+/// KCS itself is deliberately absent from this verdict — see `lockdown_status`.
+fn lockdown_verdict(hi: &HostInterface) -> Status {
+    let interface = hi.interface_enabled();
+    let auth_none = hi.auth_none_allowed();
+    let bootstrap = hi.credential_bootstrapping_enabled();
+
+    let message = format!(
+        "host_interface={interface}, auth_none={auth_none}, cred_bootstrap={bootstrap}; \
+         KCS not exposed via Redfish on this platform (state unknown)"
+    );
+
+    let is_locked = !interface && !auth_none && !bootstrap;
+    let is_unlocked = interface && auth_none && bootstrap;
+
+    Status {
+        message,
+        status: if is_locked {
+            StatusInternal::Enabled
+        } else if is_unlocked {
+            StatusInternal::Disabled
+        } else {
+            StatusInternal::Partial
+        },
+    }
+}
 
 pub struct Bmc {
     s: RedfishStandard,
@@ -378,52 +467,75 @@ impl Redfish for Bmc {
         })
     }
 
-    /// Giga Computing R263-ZG0 lockdown — HostInterfaces only.
+    /// Giga Computing R263-ZG0 lockdown — closes both credential-free host
+    /// paths on the host interface, then verifies by reading the result back.
     ///
-    /// See `lockdown_status` for the platform limitation: KCS and USB lockdown
-    /// aren't exposed via Redfish on Megarac/AST2600, so this only closes the
-    /// host→BMC USB-NIC channel.
+    /// `Enabled` disables the interface, drops `AuthNone` from
+    /// `AuthenticationModes`, and turns off `CredentialBootstrapping`;
+    /// `Disabled` restores all three. Dropping `AuthNone` on its own would
+    /// achieve nothing — the host could still bootstrap credentials and log in
+    /// with them — so the three are written together or not at all.
+    ///
+    /// KCS is out of reach here; see `lockdown_status`.
     fn lockdown<'a>(
         &'a self,
         target: EnabledDisabled,
     ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
-            let hi_enabled = target == EnabledDisabled::Disabled;
-            let hi_body = HashMap::from([("InterfaceEnabled", hi_enabled)]);
+            let locking = target == EnabledDisabled::Enabled;
+            let auth_mode = if locking { AUTH_SESSION } else { AUTH_NONE };
+            let hi_body = HashMap::from([
+                ("InterfaceEnabled", serde_json::json!(!locking)),
+                ("AuthenticationModes", serde_json::json!([auth_mode])),
+                (
+                    "CredentialBootstrapping",
+                    serde_json::json!({ "Enabled": !locking }),
+                ),
+            ]);
             self.s
                 .client
-                .patch_with_if_match("Managers/Self/HostInterfaces/Self", hi_body)
-                .await
+                .patch_with_if_match(HOST_INTERFACE_URL, hi_body)
+                .await?;
+
+            // A Redfish PATCH may answer 200 while silently dropping properties
+            // the firmware doesn't implement, reporting them only in
+            // @Message.ExtendedInfo. Trusting the status code here would report
+            // a machine as locked down while the host can still reach the BMC,
+            // so confirm against what the BMC actually stored.
+            let verdict = lockdown_verdict(&self.host_interface().await?);
+            let applied = if locking {
+                verdict.is_fully_enabled()
+            } else {
+                verdict.is_fully_disabled()
+            };
+            if !applied {
+                return Err(RedfishError::GenericError {
+                    error: format!(
+                        "lockdown({target}) did not take effect on {HOST_INTERFACE_URL}: {}",
+                        verdict.message()
+                    ),
+                });
+            }
+            Ok(())
         })
     }
 
-    /// Giga Computing R263-ZG0 lockdown status — HostInterfaces only.
+    /// Giga Computing R263-ZG0 lockdown status — host interface only.
     ///
-    /// KCS access is not configurable via Redfish on Megarac/AST2600 — it must
-    /// be set at the BMC firmware level (e.g. `ipmitool channel setaccess`) at
-    /// provisioning time, and we can't read its state from here either. So a
-    /// "fully Enabled" result from this function only means HostInterfaces is
-    /// closed; KCS may still be open and we have no way to know.
+    /// Reports `Enabled` only when every path visible over Redfish is shut:
+    /// the interface is disabled, `AuthNone` is gone, and credential
+    /// bootstrapping is off. Any partial combination is `Partial` — in
+    /// particular an interface that is disabled while bootstrapping stays on,
+    /// which is what machines locked down by earlier versions of this code
+    /// look like.
+    ///
+    /// KCS is not represented. It is not configurable over Redfish on
+    /// Megarac/AST2600 — it has to be set at BMC firmware level (e.g.
+    /// `ipmitool channel setaccess`) at provisioning time, and its state can't
+    /// be read from here either. So `Enabled` means "every path we can see is
+    /// closed", not "the host cannot reach the BMC".
     fn lockdown_status<'a>(&'a self) -> crate::RedfishFuture<'a, Result<Status, RedfishError>> {
-        Box::pin(async move {
-            let hi_url = "Managers/Self/HostInterfaces/Self";
-            let (_status, hi): (_, serde_json::Value) = self.s.client.get(hi_url).await?;
-            let hi_enabled = hi
-                .get("InterfaceEnabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-
-            let message = format!("host_interface={}", hi_enabled);
-
-            Ok(Status {
-                message,
-                status: if !hi_enabled {
-                    StatusInternal::Enabled
-                } else {
-                    StatusInternal::Disabled
-                },
-            })
-        })
+        Box::pin(async move { Ok(lockdown_verdict(&self.host_interface().await?)) })
     }
 
     /// Setup serial console for AMI BMC via BIOS attributes.
@@ -910,8 +1022,10 @@ impl Redfish for Bmc {
         Box::pin(async move {
             let interface_enabled = target == EnabledDisabled::Disabled;
             let hi_body = HashMap::from([("InterfaceEnabled", interface_enabled)]);
-            let hi_url = "Managers/Self/HostInterfaces/Self";
-            self.s.client.patch_with_if_match(hi_url, hi_body).await
+            self.s
+                .client
+                .patch_with_if_match(HOST_INTERFACE_URL, hi_body)
+                .await
         })
     }
 
@@ -1118,6 +1232,12 @@ impl Bmc {
         let data = HashMap::from([("Boot", boot_data)]);
         let url = format!("Systems/{}", self.s.system_id());
         self.s.client.patch_with_if_match(&url, data).await
+    }
+
+    /// The BMC's single host interface, narrowed to the lockdown-relevant fields.
+    async fn host_interface(&self) -> Result<HostInterface, RedfishError> {
+        let (_status, hi) = self.s.client.get(HOST_INTERFACE_URL).await?;
+        Ok(hi)
     }
 
     async fn get_system_and_boot_options(
