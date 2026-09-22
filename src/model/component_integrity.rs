@@ -72,7 +72,9 @@ pub struct IdentityAuthentication {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct ResponderAuthentication {
-    pub component_certificate: ODataId,
+    /// Absent on BMCs that report an SPDM responder without publishing its
+    /// identity certificate. Optional in the Redfish schema.
+    pub component_certificate: Option<ODataId>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -84,8 +86,10 @@ pub struct SPDMActions {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SPDMGetSignedMeasurements {
+    /// Optional Redfish annotation; BMCs may expose the action without
+    /// describing its parameters.
     #[serde(rename = "@Redfish.ActionInfo")]
-    pub action_info: String,
+    pub action_info: Option<String>,
     pub target: String,
 }
 
@@ -124,7 +128,110 @@ pub struct RegexToFirmwareIdOptions {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::component_integrity::CaCertificate;
+    use crate::model::component_integrity::{CaCertificate, ComponentIntegrity};
+
+    /// An SPDM responder without a published identity certificate, and an
+    /// action without its parameter annotation. Both properties are optional in
+    /// the Redfish schema, and HPE iLO omits both.
+    #[test]
+    fn test_component_integrity_without_certificate_or_action_info() {
+        let component_integrity = r##"{
+    "@odata.id": "/redfish/v1/ComponentIntegrity/0",
+    "@odata.type": "#ComponentIntegrity.v1_2_0.ComponentIntegrity",
+    "Id": "0",
+    "Actions": {
+        "#ComponentIntegrity.SPDMGetSignedMeasurements": {
+            "target": "/redfish/v1/ComponentIntegrity/0/Actions/ComponentIntegrity.SPDMGetSignedMeasurements"
+        }
+    },
+    "ComponentIntegrityEnabled": false,
+    "ComponentIntegrityType": "SPDM",
+    "ComponentIntegrityTypeVersion": "N/A",
+    "Name": "Component Integrity",
+    "SPDM": {
+        "IdentityAuthentication": {
+            "ResponderAuthentication": {
+                "VerificationStatus": null
+            }
+        },
+        "Requester": {
+            "@odata.id": "/redfish/v1/Managers/1"
+        }
+    },
+    "TargetComponentURI": "/redfish/v1/Chassis/1/NetworkAdapters/00000000"
+}"##;
+
+        let parsed: ComponentIntegrity = serde_json::from_str(component_integrity).unwrap();
+        let spdm = parsed.spdm.unwrap();
+        assert!(spdm
+            .identity_authentication
+            .responder_authentication
+            .component_certificate
+            .is_none());
+
+        // The action stays usable: only the annotation is missing.
+        let action = parsed.actions.unwrap().get_signed_measurements.unwrap();
+        assert!(action.action_info.is_none());
+        assert_eq!(
+            action.target,
+            "/redfish/v1/ComponentIntegrity/0/Actions/ComponentIntegrity.SPDMGetSignedMeasurements"
+        );
+    }
+
+    /// A responder that publishes both properties still parses them.
+    #[test]
+    fn test_component_integrity_with_certificate_and_action_info() {
+        let component_integrity = r##"{
+    "@odata.id": "/redfish/v1/ComponentIntegrity/ERoT_BMC_0",
+    "Id": "ERoT_BMC_0",
+    "Actions": {
+        "#ComponentIntegrity.SPDMGetSignedMeasurements": {
+            "@Redfish.ActionInfo": "/redfish/v1/ComponentIntegrity/ERoT_BMC_0/SPDMGetSignedMeasurementsActionInfo",
+            "target": "/redfish/v1/ComponentIntegrity/ERoT_BMC_0/Actions/ComponentIntegrity.SPDMGetSignedMeasurements"
+        }
+    },
+    "ComponentIntegrityEnabled": true,
+    "ComponentIntegrityType": "SPDM",
+    "ComponentIntegrityTypeVersion": "1.1.0",
+    "Name": "ERoT_BMC_0 Integrity",
+    "SPDM": {
+        "IdentityAuthentication": {
+            "ResponderAuthentication": {
+                "ComponentCertificate": {
+                    "@odata.id": "/redfish/v1/Chassis/ERoT_BMC_0/Certificates/CertChain"
+                }
+            }
+        },
+        "Requester": {
+            "@odata.id": "/redfish/v1/Managers/BMC_0"
+        }
+    },
+    "TargetComponentURI": "/redfish/v1/Managers/BMC_0"
+}"##;
+
+        let parsed: ComponentIntegrity = serde_json::from_str(component_integrity).unwrap();
+        let certificate = parsed
+            .spdm
+            .unwrap()
+            .identity_authentication
+            .responder_authentication
+            .component_certificate
+            .unwrap();
+        assert_eq!(
+            certificate.odata_id,
+            "/redfish/v1/Chassis/ERoT_BMC_0/Certificates/CertChain"
+        );
+        assert_eq!(
+            parsed
+                .actions
+                .unwrap()
+                .get_signed_measurements
+                .unwrap()
+                .action_info
+                .unwrap(),
+            "/redfish/v1/ComponentIntegrity/ERoT_BMC_0/SPDMGetSignedMeasurementsActionInfo"
+        );
+    }
 
     #[test]
     fn test_ca_certificate_serialization_deserialization() {
