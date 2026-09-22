@@ -1868,7 +1868,12 @@ impl RedfishStandard {
 
         if matches!(
             self.vendor,
-            Some(RedfishVendor::AMI | RedfishVendor::LenovoAMI | RedfishVendor::LenovoGB300)
+            Some(
+                RedfishVendor::AMI
+                    | RedfishVendor::LenovoAMI
+                    | RedfishVendor::LenovoGB300
+                    | RedfishVendor::GigaComputingAMI
+            )
         ) {
             match self.client.patch_with_if_match(&url, ntp_servers).await {
                 Err(RedfishError::HTTPErrorCode {
