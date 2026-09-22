@@ -1421,7 +1421,6 @@ impl RedfishStandard {
                 if self.system_id == "DGX" && self.manager_id == "BMC" {
                     Ok(Box::new(crate::nvidia_viking::Bmc::new(self.clone())?))
                 } else if self.is_giga_computing().await {
-                    debug!("BMC Vendor refined: AMI -> GigaComputingAMI");
                     self.vendor = Some(RedfishVendor::GigaComputingAMI);
                     Ok(Box::new(crate::giga_computing_ami::Bmc::new(self.clone())?))
                 } else {
@@ -1471,10 +1470,7 @@ impl RedfishStandard {
                 .as_deref()
                 .map(|m| m.eq_ignore_ascii_case("Giga Computing"))
                 .unwrap_or(false),
-            Err(e) => {
-                debug!("is_giga_computing: failed to fetch system: {e}");
-                false
-            }
+            Err(e) => false,
         }
     }
 
