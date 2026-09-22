@@ -6,7 +6,10 @@ use crate::{
     jsonmap,
     model::{
         account_service::ManagerAccount,
-        boot::{BootOverride, BootSourceOverrideEnabled, BootSourceOverrideTarget},
+        boot::{
+            BootOverride, BootSourceOverrideEnabled, BootSourceOverrideMode,
+            BootSourceOverrideTarget,
+        },
         certificate::Certificate,
         chassis::{Assembly, Chassis, NetworkAdapter},
         component_integrity::ComponentIntegrities,
@@ -644,38 +647,55 @@ impl Redfish for Bmc {
         })
     }
 
-    /// AMI requires patching `/Systems/{id}` (NOT `/SD`) with an `If-Match` header.
+    /// AMI requires patching `/Systems/{id}` (NOT the `@Redfish.Settings` object
+    /// `/SD`, which this firmware reserves for the BIOS-staged `BootOrder` /
+    /// `AliasBootOrder` -- see [`Redfish::change_boot_order`]) with an `If-Match`
+    /// header.
+    ///
+    /// `Boot.HttpBootUri` is the only mechanism for pinning a UEFI HTTP boot URL
+    /// on this platform: unlike Dell (`HttpDev1Uri`) and HPE (`UrlBootFile`), the
+    /// R263-ZG0 BIOS registry exposes no URI attribute at all, only the
+    /// `NWSK006`/`NWSK007` IPv4/IPv6 HTTP enable switches.
+    ///
+    /// When `settings.http_boot_uri` is `None` the key is omitted, leaving
+    /// whatever URI the BMC already holds -- it does not clear a previously
+    /// pinned URL. Mode defaults to `UEFI` when unspecified, matching generic AMI.
+    ///
+    /// Returns `Ok(None)`: the change applies immediately. This firmware reports
+    /// `JobService.Status.State: Disabled` and stages nothing, so there is no job
+    /// ID to hand back.
+    ///
+    /// Verified against: R263-ZG0-AAL2-000, BIOS R23_F20, `ComputerSystem.v1_21_0`.
     fn set_boot_override<'a>(
         &'a self,
-        _settings: BootOverride,
+        settings: BootOverride,
     ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
-        unimplemented!()
-        // Box::pin(async move {
-        //     let mut boot_data: HashMap<String, serde_json::Value> = HashMap::new();
-        //     boot_data.insert(
-        //         "BootSourceOverrideTarget".to_string(),
-        //         settings.target.to_string().into(),
-        //     );
-        //     boot_data.insert(
-        //         "BootSourceOverrideEnabled".to_string(),
-        //         settings.enabled.to_string().into(),
-        //     );
-        //     // AMI BMCs default to UEFI mode when the caller doesn't specify one.
-        //     let mode = settings.mode.unwrap_or(BootSourceOverrideMode::UEFI);
-        //     boot_data.insert(
-        //         "BootSourceOverrideMode".to_string(),
-        //         mode.to_string().into(),
-        //     );
-        //     if let Some(uri) = settings.http_boot_uri {
-        //         boot_data.insert("HttpBootUri".to_string(), uri.into());
-        //     }
-        //     let url = format!("Systems/{}", self.s.system_id());
-        //     self.s
-        //         .client
-        //         .patch_with_if_match(&url, HashMap::from([("Boot", boot_data)]))
-        //         .await?;
-        //     Ok(None)
-        // })
+        Box::pin(async move {
+            let mut boot_data: HashMap<String, serde_json::Value> = HashMap::new();
+            boot_data.insert(
+                "BootSourceOverrideTarget".to_string(),
+                settings.target.to_string().into(),
+            );
+            boot_data.insert(
+                "BootSourceOverrideEnabled".to_string(),
+                settings.enabled.to_string().into(),
+            );
+            // AMI BMCs default to UEFI mode when the caller doesn't specify one.
+            let mode = settings.mode.unwrap_or(BootSourceOverrideMode::UEFI);
+            boot_data.insert(
+                "BootSourceOverrideMode".to_string(),
+                mode.to_string().into(),
+            );
+            if let Some(uri) = settings.http_boot_uri {
+                boot_data.insert("HttpBootUri".to_string(), uri.into());
+            }
+            let url = format!("Systems/{}", self.s.system_id());
+            self.s
+                .client
+                .patch_with_if_match(&url, HashMap::from([("Boot", boot_data)]))
+                .await?;
+            Ok(None)
+        })
     }
 
     /// AMI BMC requires If-Match header for boot order changes
