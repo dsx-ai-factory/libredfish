@@ -1043,26 +1043,73 @@ async fn resource_tests(redfish: &dyn Redfish) -> Result<(), anyhow::Error> {
 
 fn test_python_venv() -> Result<(), anyhow::Error> {
     let venv_dir = get_tmp_dir();
-    let venv_out = Command::new("python3")
-        .arg("-m")
-        .arg("venv")
-        .arg(&venv_dir)
-        .output()
-        .context("Is 'python3' on your $PATH?")?;
+    let mut command = Command::new("python3");
+    command.arg("-m").arg("venv").arg(&venv_dir);
+    check_python_venv(&mut command, &venv_dir)
+}
+
+// Keep the original bootstrap failure even when venv did not create its directory.
+// Accepting a Command here also lets tests induce both failure shapes without
+// mutating the process-wide PATH used by parallel integration tests.
+fn check_python_venv(
+    command: &mut Command,
+    venv_dir: &std::path::Path,
+) -> Result<(), anyhow::Error> {
+    let venv_out = command.output().context("Is 'python3' on your $PATH?")?;
     if !venv_out.status.success() {
-        eprintln!("*** Python virtual env creation failed:");
-        eprintln!("\tSTDOUT: {}", String::from_utf8_lossy(&venv_out.stdout));
-        eprintln!("\tSTDERR: {}", String::from_utf8_lossy(&venv_out.stderr));
-        std::fs::remove_dir_all(venv_dir.clone())?;
+        let cleanup = match std::fs::remove_dir_all(venv_dir) {
+            Ok(()) => String::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => format!("; additionally failed to remove venv directory: {e}"),
+        };
         return Err(anyhow!(
-            "Failed running 'python3 -m venv {}. Exit code {}",
-            venv_dir.clone().display(),
-            venv_out.status.code().unwrap_or(-1),
+            "Failed running 'python3 -m venv {}'. Exit status {}. STDOUT: {} STDERR: {}{}",
+            venv_dir.display(),
+            venv_out.status,
+            String::from_utf8_lossy(&venv_out.stdout),
+            String::from_utf8_lossy(&venv_out.stderr),
+            cleanup,
         ));
     }
 
     std::fs::remove_dir_all(venv_dir)?;
     Ok(())
+}
+
+#[test]
+fn test_python_venv_failure_before_directory_creation() {
+    let venv_dir = get_tmp_dir();
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("printf 'bootstrap stdout\\n'; printf 'bootstrap failed\\n' >&2; exit 23");
+    let error = check_python_venv(&mut command, &venv_dir)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&venv_dir.display().to_string()), "{error}");
+    assert!(error.contains("exit status: 23"), "{error}");
+    assert!(error.contains("bootstrap stdout"), "{error}");
+    assert!(error.contains("bootstrap failed"), "{error}");
+    assert!(!error.contains("No such file or directory"), "{error}");
+    assert!(!venv_dir.exists());
+}
+
+#[test]
+fn test_python_venv_failure_after_partial_directory_creation() {
+    let venv_dir = get_tmp_dir();
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("mkdir -p \"$1\"; printf 'partial bootstrap failed\\n' >&2; exit 24")
+        .arg("bootstrap")
+        .arg(&venv_dir);
+    let error = check_python_venv(&mut command, &venv_dir)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&venv_dir.display().to_string()), "{error}");
+    assert!(error.contains("exit status: 24"), "{error}");
+    assert!(error.contains("partial bootstrap failed"), "{error}");
+    assert!(!venv_dir.exists());
 }
 
 /// Create a python virtualenv to install our requirements into.
