@@ -120,6 +120,9 @@ async fn test_dell_account_creation_policies() -> Result<(), anyhow::Error> {
         .await?;
     assert_eq!(modern["UserName"], "modern_user");
     assert_eq!(modern["RoleId"], "Administrator");
+    // The fixture persists the POST payload verbatim. This must be a JSON
+    // boolean, not a string or an implicit firmware default.
+    assert_eq!(modern["Enabled"], serde_json::json!(true));
     assert_eq!(
         redfish.std_redfish().get_account_by_id("4").await?.enabled,
         Some(false)

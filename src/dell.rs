@@ -24,7 +24,7 @@ use std::{collections::HashMap, path::Path, time::Duration};
 
 use reqwest::{header::HeaderMap, Method, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::fs::File;
 
 use crate::{
@@ -104,10 +104,16 @@ impl Redfish for Bmc {
         Box::pin(async move {
             // Recent iDRACs create accounts through the collection. Older firmware
             // returns 405 and requires editing a pre-existing disabled slot.
-            match <RedfishStandard as Redfish>::create_user(&self.s, username, password, role_id)
-                .await
-            {
-                Ok(()) => return Ok(()),
+            // Dell requires an enabled account for a successful login. Make this
+            // explicit rather than relying on firmware defaults for collection POST.
+            let account = HashMap::from([
+                ("UserName", json!(username)),
+                ("Password", json!(password)),
+                ("RoleId", json!(role_id.to_string())),
+                ("Enabled", json!(true)),
+            ]);
+            match self.s.client.post("AccountService/Accounts", account).await {
+                Ok(_) => return Ok(()),
                 Err(RedfishError::HTTPErrorCode { status_code, .. })
                     if status_code == StatusCode::METHOD_NOT_ALLOWED => {}
                 Err(error) => return Err(error),
