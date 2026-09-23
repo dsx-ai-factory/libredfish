@@ -90,6 +90,60 @@ async fn test_dell() -> Result<(), anyhow::Error> {
     run_integration_test("dell", DELL_PORT).await
 }
 
+// Exercises the public Dell Redfish client against both iDRAC account policies.
+// The canned 405 is restricted to legacy_user; other POSTs create members.
+#[tokio::test]
+async fn test_dell_account_creation_policies() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("dell", "8746")?;
+    let endpoint = libredfish::Endpoint {
+        host: "127.0.0.1:8746".to_string(),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let redfish = pool.create_client(endpoint).await?;
+
+    // A collection POST must create an account, not PATCH the first disabled slot.
+    redfish
+        .create_user(
+            "modern_user",
+            "test-password",
+            libredfish::RoleId::Administrator,
+        )
+        .await?;
+    // The mockup stores POST payloads as-is, without a resource @odata.type.
+    let (_, modern): (_, serde_json::Value) = redfish
+        .std_redfish()
+        .client
+        .get("AccountService/Accounts/17")
+        .await?;
+    assert_eq!(modern["UserName"], "modern_user");
+    assert_eq!(modern["RoleId"], "Administrator");
+    assert_eq!(
+        redfish.std_redfish().get_account_by_id("4").await?.enabled,
+        Some(false)
+    );
+
+    // An older iDRAC rejects POST with 405; slot 3 is enabled, slot 4 is
+    // present and disabled, so only slot 4 may be patched.
+    redfish
+        .create_user(
+            "legacy_user",
+            "test-password",
+            libredfish::RoleId::Administrator,
+        )
+        .await?;
+    assert_eq!(
+        redfish.std_redfish().get_account_by_id("3").await?.username,
+        "tests_admin"
+    );
+    let legacy = redfish.std_redfish().get_account_by_id("4").await?;
+    assert_eq!(legacy.username, "legacy_user");
+    assert_eq!(legacy.enabled, Some(true));
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_dell_multi_dpu() -> Result<(), anyhow::Error> {
     run_integration_test("dell_multi_dpu", DELL_MULTI_DPU_PORT).await
