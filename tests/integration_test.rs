@@ -144,6 +144,57 @@ async fn test_dell_account_creation_policies() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+// The mock's DELETE tombstones account 3 for this server only. A legacy iDRAC
+// must skip that missing slot and PATCH the next existing disabled slot.
+#[tokio::test]
+async fn test_dell_account_creation_skips_missing_slot() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("dell", "8747")?;
+    let endpoint = libredfish::Endpoint {
+        host: "127.0.0.1:8747".to_string(),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let redfish = pool.create_client(endpoint).await?;
+
+    redfish
+        .std_redfish()
+        .client
+        .delete("AccountService/Accounts/3")
+        .await?;
+    // A well-framed GET 404 is recognized as a missing account, not a
+    // transport/JSON error. The fallback must never PATCH this slot.
+    assert!(redfish
+        .std_redfish()
+        .get_account_by_id("3")
+        .await
+        .unwrap_err()
+        .not_found());
+    assert_eq!(
+        redfish.std_redfish().get_account_by_id("4").await?.enabled,
+        Some(false)
+    );
+
+    redfish
+        .create_user(
+            "legacy_user",
+            "test-password",
+            libredfish::RoleId::Administrator,
+        )
+        .await?;
+    let account = redfish.std_redfish().get_account_by_id("4").await?;
+    assert_eq!(account.username, "legacy_user");
+    assert_eq!(account.enabled, Some(true));
+    assert!(redfish
+        .std_redfish()
+        .get_account_by_id("3")
+        .await
+        .unwrap_err()
+        .not_found());
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_dell_multi_dpu() -> Result<(), anyhow::Error> {
     run_integration_test("dell_multi_dpu", DELL_MULTI_DPU_PORT).await

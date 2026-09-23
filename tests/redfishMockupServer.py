@@ -694,6 +694,9 @@ class RfMockupServer(BaseHTTPRequestHandler):
 
         else:
             self.send_response(404)
+            # Empty 404 responses need explicit framing on the persistent TLS
+            # connection, or reqwest sees UnexpectedEof instead of HTTP 404.
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
     def do_PATCH(self):
