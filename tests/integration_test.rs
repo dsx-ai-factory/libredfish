@@ -21,9 +21,10 @@
  * DEALINGS IN THE SOFTWARE.
  */
 /// Test against a mockup of BMC. A mockup is a directory of JSON files mirrored from a real BMC>
-/// Mockups provide strong GET coverage; most POST/PATCH handlers only check that the resource
-/// exists and return 204. The Dell account tests additionally exercise a canned 405 for the
-/// legacy POST path and inspect the stored modern POST payload for Enabled=true.
+/// Mockups provide strong GET coverage. This lightweight fixture merges resource PATCH payloads
+/// and stores collection POST payloads, returning 204 for successful mutations without firmware
+/// validation. Dell account tests exercise a canned 405 for the legacy-case POST and inspect
+/// the stored modern POST payload for Enabled=true.
 ///
 /// See tests/mockup/README for details.
 use std::{
