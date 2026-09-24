@@ -21,9 +21,10 @@
  * DEALINGS IN THE SOFTWARE.
  */
 /// Test against a mockup of BMC. A mockup is a directory of JSON files mirrored from a real BMC>
-/// This makes for very good test for GET (e.g. get_power_state) calls, but is only a basic test
-/// for POST/PATCH. For those the mockup server checks the path exists but doesn't check the body
-/// values, and always returns '204 No Content'.
+/// Mockups provide strong GET coverage. This lightweight fixture merges resource PATCH payloads
+/// and stores collection POST payloads, returning 204 for successful mutations without firmware
+/// validation. Dell account tests exercise a canned 405 for the legacy-case POST and inspect
+/// the stored modern POST payload for Enabled=true.
 ///
 /// See tests/mockup/README for details.
 use std::{
@@ -88,6 +89,164 @@ macro_rules! test_vendor_collection_count {
 #[tokio::test]
 async fn test_dell() -> Result<(), anyhow::Error> {
     run_integration_test("dell", DELL_PORT).await
+}
+
+// Exercises the public Dell Redfish client against both iDRAC account policies.
+// The canned 405 is restricted to legacy_user; other POSTs create members.
+#[tokio::test]
+async fn test_dell_account_creation_policies() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("dell", "8746")?;
+    let endpoint = libredfish::Endpoint {
+        host: "127.0.0.1:8746".to_string(),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let redfish = pool.create_client(endpoint).await?;
+
+    // A collection POST must create an account, not PATCH the first disabled slot.
+    redfish
+        .create_user(
+            "modern_user",
+            "test-password",
+            libredfish::RoleId::Administrator,
+        )
+        .await?;
+    // The mockup stores POST payloads as-is, without a resource @odata.type.
+    let (_, modern): (_, serde_json::Value) = redfish
+        .std_redfish()
+        .client
+        .get("AccountService/Accounts/17")
+        .await?;
+    assert_eq!(modern["UserName"], "modern_user");
+    assert_eq!(modern["RoleId"], "Administrator");
+    // The fixture persists the POST payload verbatim. This must be a JSON
+    // boolean, not a string or an implicit firmware default.
+    assert_eq!(modern["Enabled"], serde_json::json!(true));
+    assert_eq!(
+        redfish.std_redfish().get_account_by_id("4").await?.enabled,
+        Some(false)
+    );
+
+    // An older iDRAC rejects POST with 405; slot 3 is enabled, slot 4 is
+    // present and disabled, so only slot 4 may be patched.
+    redfish
+        .create_user(
+            "legacy_user",
+            "test-password",
+            libredfish::RoleId::Administrator,
+        )
+        .await?;
+    assert_eq!(
+        redfish.std_redfish().get_account_by_id("3").await?.username,
+        "tests_admin"
+    );
+    let legacy = redfish.std_redfish().get_account_by_id("4").await?;
+    assert_eq!(legacy.username, "legacy_user");
+    assert_eq!(legacy.enabled, Some(true));
+    Ok(())
+}
+
+// A non-405 POST failure must propagate without attempting the legacy slot PATCH.
+#[tokio::test]
+async fn test_dell_account_creation_post_error_does_not_fallback() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("dell", "8748")?;
+    let endpoint = libredfish::Endpoint {
+        host: "127.0.0.1:8748".to_string(),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let redfish = pool.create_client(endpoint).await?;
+
+    let (_, before): (_, serde_json::Value) = redfish
+        .std_redfish()
+        .client
+        .get("AccountService/Accounts/4")
+        .await?;
+    assert_eq!(before["Enabled"], serde_json::json!(false));
+
+    match redfish
+        .create_user(
+            "server_error_user",
+            "test-password",
+            libredfish::RoleId::Administrator,
+        )
+        .await
+    {
+        Err(libredfish::RedfishError::HTTPErrorCode {
+            status_code,
+            response_body,
+            ..
+        }) => {
+            assert_eq!(status_code, 500);
+            assert_eq!(response_body, "fixture Dell collection POST error");
+        }
+        other => panic!("Expected the collection POST HTTP 500, got {other:?}"),
+    }
+    let (_, after): (_, serde_json::Value) = redfish
+        .std_redfish()
+        .client
+        .get("AccountService/Accounts/4")
+        .await?;
+    assert_eq!(
+        after, before,
+        "non-405 failure must not PATCH account slot 4"
+    );
+    Ok(())
+}
+
+// The mock's DELETE tombstones account 3 for this server only. A legacy iDRAC
+// must skip that missing slot and PATCH the next existing disabled slot.
+#[tokio::test]
+async fn test_dell_account_creation_skips_missing_slot() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("dell", "8747")?;
+    let endpoint = libredfish::Endpoint {
+        host: "127.0.0.1:8747".to_string(),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let redfish = pool.create_client(endpoint).await?;
+
+    redfish
+        .std_redfish()
+        .client
+        .delete("AccountService/Accounts/3")
+        .await?;
+    // A well-framed GET 404 is recognized as a missing account, not a
+    // transport/JSON error. The fallback must never PATCH this slot.
+    assert!(redfish
+        .std_redfish()
+        .get_account_by_id("3")
+        .await
+        .unwrap_err()
+        .not_found());
+    assert_eq!(
+        redfish.std_redfish().get_account_by_id("4").await?.enabled,
+        Some(false)
+    );
+
+    redfish
+        .create_user(
+            "legacy_user",
+            "test-password",
+            libredfish::RoleId::Administrator,
+        )
+        .await?;
+    let account = redfish.std_redfish().get_account_by_id("4").await?;
+    assert_eq!(account.username, "legacy_user");
+    assert_eq!(account.enabled, Some(true));
+    assert!(redfish
+        .std_redfish()
+        .get_account_by_id("3")
+        .await
+        .unwrap_err()
+        .not_found());
+    Ok(())
 }
 
 #[tokio::test]
@@ -935,26 +1094,73 @@ async fn resource_tests(redfish: &dyn Redfish) -> Result<(), anyhow::Error> {
 
 fn test_python_venv() -> Result<(), anyhow::Error> {
     let venv_dir = get_tmp_dir();
-    let venv_out = Command::new("python3")
-        .arg("-m")
-        .arg("venv")
-        .arg(&venv_dir)
-        .output()
-        .context("Is 'python3' on your $PATH?")?;
+    let mut command = Command::new("python3");
+    command.arg("-m").arg("venv").arg(&venv_dir);
+    check_python_venv(&mut command, &venv_dir)
+}
+
+// Keep the original bootstrap failure even when venv did not create its directory.
+// Accepting a Command here also lets tests induce both failure shapes without
+// mutating the process-wide PATH used by parallel integration tests.
+fn check_python_venv(
+    command: &mut Command,
+    venv_dir: &std::path::Path,
+) -> Result<(), anyhow::Error> {
+    let venv_out = command.output().context("Is 'python3' on your $PATH?")?;
     if !venv_out.status.success() {
-        eprintln!("*** Python virtual env creation failed:");
-        eprintln!("\tSTDOUT: {}", String::from_utf8_lossy(&venv_out.stdout));
-        eprintln!("\tSTDERR: {}", String::from_utf8_lossy(&venv_out.stderr));
-        std::fs::remove_dir_all(venv_dir.clone())?;
+        let cleanup = match std::fs::remove_dir_all(venv_dir) {
+            Ok(()) => String::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => format!("; additionally failed to remove venv directory: {e}"),
+        };
         return Err(anyhow!(
-            "Failed running 'python3 -m venv {}. Exit code {}",
-            venv_dir.clone().display(),
-            venv_out.status.code().unwrap_or(-1),
+            "Failed running 'python3 -m venv {}'. Exit status {}. STDOUT: {} STDERR: {}{}",
+            venv_dir.display(),
+            venv_out.status,
+            String::from_utf8_lossy(&venv_out.stdout),
+            String::from_utf8_lossy(&venv_out.stderr),
+            cleanup,
         ));
     }
 
     std::fs::remove_dir_all(venv_dir)?;
     Ok(())
+}
+
+#[test]
+fn test_python_venv_failure_before_directory_creation() {
+    let venv_dir = get_tmp_dir();
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("printf 'bootstrap stdout\\n'; printf 'bootstrap failed\\n' >&2; exit 23");
+    let error = check_python_venv(&mut command, &venv_dir)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&venv_dir.display().to_string()), "{error}");
+    assert!(error.contains("exit status: 23"), "{error}");
+    assert!(error.contains("bootstrap stdout"), "{error}");
+    assert!(error.contains("bootstrap failed"), "{error}");
+    assert!(!error.contains("No such file or directory"), "{error}");
+    assert!(!venv_dir.exists());
+}
+
+#[test]
+fn test_python_venv_failure_after_partial_directory_creation() {
+    let venv_dir = get_tmp_dir();
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("mkdir -p \"$1\"; printf 'partial bootstrap failed\\n' >&2; exit 24")
+        .arg("bootstrap")
+        .arg(&venv_dir);
+    let error = check_python_venv(&mut command, &venv_dir)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&venv_dir.display().to_string()), "{error}");
+    assert!(error.contains("exit status: 24"), "{error}");
+    assert!(error.contains("partial bootstrap failed"), "{error}");
+    assert!(!venv_dir.exists());
 }
 
 /// Create a python virtualenv to install our requirements into.
