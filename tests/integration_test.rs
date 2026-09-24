@@ -21,9 +21,9 @@
  * DEALINGS IN THE SOFTWARE.
  */
 /// Test against a mockup of BMC. A mockup is a directory of JSON files mirrored from a real BMC>
-/// This makes for very good test for GET (e.g. get_power_state) calls, but is only a basic test
-/// for POST/PATCH. For those the mockup server checks the path exists but doesn't check the body
-/// values, and always returns '204 No Content'.
+/// Mockups provide strong GET coverage; most POST/PATCH handlers only check that the resource
+/// exists and return 204. The Dell account tests additionally exercise a canned 405 for the
+/// legacy POST path and inspect the stored modern POST payload for Enabled=true.
 ///
 /// See tests/mockup/README for details.
 use std::{
