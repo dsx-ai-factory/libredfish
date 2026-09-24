@@ -148,6 +148,56 @@ async fn test_dell_account_creation_policies() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+// A non-405 POST failure must propagate without attempting the legacy slot PATCH.
+#[tokio::test]
+async fn test_dell_account_creation_post_error_does_not_fallback() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("dell", "8748")?;
+    let endpoint = libredfish::Endpoint {
+        host: "127.0.0.1:8748".to_string(),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let redfish = pool.create_client(endpoint).await?;
+
+    let (_, before): (_, serde_json::Value) = redfish
+        .std_redfish()
+        .client
+        .get("AccountService/Accounts/4")
+        .await?;
+    assert_eq!(before["Enabled"], serde_json::json!(false));
+
+    match redfish
+        .create_user(
+            "server_error_user",
+            "test-password",
+            libredfish::RoleId::Administrator,
+        )
+        .await
+    {
+        Err(libredfish::RedfishError::HTTPErrorCode {
+            status_code,
+            response_body,
+            ..
+        }) => {
+            assert_eq!(status_code, 500);
+            assert_eq!(response_body, "fixture Dell collection POST error");
+        }
+        other => panic!("Expected the collection POST HTTP 500, got {other:?}"),
+    }
+    let (_, after): (_, serde_json::Value) = redfish
+        .std_redfish()
+        .client
+        .get("AccountService/Accounts/4")
+        .await?;
+    assert_eq!(
+        after, before,
+        "non-405 failure must not PATCH account slot 4"
+    );
+    Ok(())
+}
+
 // The mock's DELETE tombstones account 3 for this server only. A legacy iDRAC
 // must skip that missing slot and PATCH the next existing disabled slot.
 #[tokio::test]

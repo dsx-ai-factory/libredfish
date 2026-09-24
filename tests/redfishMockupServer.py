@@ -813,15 +813,16 @@ class RfMockupServer(BaseHTTPRequestHandler):
 
         if data_received is not None:
             logger.info("   POST: Data: {}".format(data_received))
-            # Canned POST response for firmware that rejects collection account creation.
-            post_response_fpath = self.construct_path(self.path, "post_response.json")
-            if os.path.isfile(post_response_fpath):
-                with open(post_response_fpath) as f:
-                    canned = json.load(f)
-                match = canned.get("match_request_body_contains")
-                if match is None or match in json.dumps(data_received):
-                    self.send_response_file(post_response_fpath)
-                    return
+            # Canned POST responses for legacy 405 and a non-405 Dell error.
+            for response_file in ("post_response.json", "post_response_server_error.json"):
+                post_response_fpath = self.construct_path(self.path, response_file)
+                if os.path.isfile(post_response_fpath):
+                    with open(post_response_fpath) as f:
+                        canned = json.load(f)
+                    match = canned.get("match_request_body_contains")
+                    if match is None or match in json.dumps(data_received):
+                        self.send_response_file(post_response_fpath)
+                        return
 
             # construct path "mockdir/path/to/resource/<filename>"
             fpath = self.construct_path(self.path, "index.json")
