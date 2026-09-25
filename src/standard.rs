@@ -168,7 +168,12 @@ impl Redfish for RedfishStandard {
             // AMI BMC requires If-Match header for PATCH requests
             if matches!(
                 service_root.vendor(),
-                Some(RedfishVendor::AMI | RedfishVendor::LenovoAMI | RedfishVendor::LenovoGB300)
+                Some(
+                    RedfishVendor::AMI
+                        | RedfishVendor::LenovoAMI
+                        | RedfishVendor::LenovoGB300
+                        | RedfishVendor::GigaComputingAMI
+                )
             ) {
                 self.client.patch_with_if_match(&url, &data).await
             } else {
@@ -892,6 +897,15 @@ impl Redfish for RedfishStandard {
                     }
                 }
             }
+
+            // connect refined AMI -> GigaComputingAMI from the system/chassis
+            // Manufacturer, which the raw service-root string cannot express.
+            // Stamp it so callers that re-derive a vendor from /redfish/v1 see
+            // the vendor this client actually dispatched on.
+            if self.vendor == Some(RedfishVendor::GigaComputingAMI) {
+                body.vendor = Some("Giga Computing".to_string());
+            }
+
             Ok(body)
         })
     }
@@ -1411,6 +1425,9 @@ impl RedfishStandard {
             RedfishVendor::AMI => {
                 if self.system_id == "DGX" && self.manager_id == "BMC" {
                     Ok(Box::new(crate::nvidia_viking::Bmc::new(self.clone())?))
+                } else if self.is_giga_computing().await {
+                    self.vendor = Some(RedfishVendor::GigaComputingAMI);
+                    Ok(Box::new(crate::giga_computing_ami::Bmc::new(self.clone())?))
                 } else {
                     Ok(Box::new(crate::ami::Bmc::new(self.clone())?))
                 }
@@ -1420,6 +1437,9 @@ impl RedfishStandard {
             RedfishVendor::Lenovo => Ok(Box::new(crate::lenovo::Bmc::new(self.clone())?)),
             RedfishVendor::LenovoAMI => Ok(Box::new(crate::ami::Bmc::new(self.clone())?)),
             RedfishVendor::LenovoGB300 => Ok(Box::new(crate::ami::Bmc::new(self.clone())?)),
+            RedfishVendor::GigaComputingAMI => {
+                Ok(Box::new(crate::giga_computing_ami::Bmc::new(self.clone())?))
+            }
             RedfishVendor::NvidiaDpu => Ok(Box::new(crate::nvidia_dpu::Bmc::new(self.clone())?)),
             RedfishVendor::NvidiaGBx00 => {
                 Ok(Box::new(crate::nvidia_gbx00::Bmc::new(self.clone())?))
@@ -1442,6 +1462,20 @@ impl RedfishStandard {
             }
             RedfishVendor::Sushy => Ok(Box::new(crate::sushy::Bmc::new(self.clone())?)),
             _ => Ok(Box::new(self.clone())),
+        }
+    }
+
+    /// Distinguish a Giga Computing AMI BMC from a generic AMI BMC by reading
+    /// the ComputerSystem `Manufacturer` field. Failures are treated as not-Giga
+    /// so detection never blocks the dispatch path.
+    async fn is_giga_computing(&self) -> bool {
+        match self.get_system().await {
+            Ok(sys) => sys
+                .manufacturer
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case("Giga Computing"))
+                .unwrap_or(false),
+            Err(_) => false,
         }
     }
 
@@ -1839,7 +1873,12 @@ impl RedfishStandard {
 
         if matches!(
             self.vendor,
-            Some(RedfishVendor::AMI | RedfishVendor::LenovoAMI | RedfishVendor::LenovoGB300)
+            Some(
+                RedfishVendor::AMI
+                    | RedfishVendor::LenovoAMI
+                    | RedfishVendor::LenovoGB300
+                    | RedfishVendor::GigaComputingAMI
+            )
         ) {
             match self.client.patch_with_if_match(&url, ntp_servers).await {
                 Err(RedfishError::HTTPErrorCode {
