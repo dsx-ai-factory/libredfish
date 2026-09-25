@@ -1,3 +1,18 @@
+//! Giga Computing (AMI MegaRAC) BMC support.
+//!
+//! # Warning: dev / trusted environments only
+//!
+//! This implementation cannot fully lock the BMC down from the host. The IPMI
+//! KCS interface is not exposed over Redfish on this platform (Megarac/AST2600),
+//! so it can be neither disabled nor inspected from here. Any process on the
+//! host with access to KCS can talk to the BMC with no credentials — including
+//! fetching bootstrap credentials with an administrator role — regardless of
+//! what [`Redfish::lockdown`] reports.
+//!
+//! Use it only in development or otherwise trusted environments where the host
+//! OS is not an adversary, unless KCS has been disabled out of band at BMC
+//! firmware level.
+
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use serde::Deserialize;
