@@ -898,7 +898,7 @@ impl Redfish for RedfishStandard {
                 }
             }
 
-            // `connect` refined AMI -> GigaComputingAMI from the system/chassis
+            // connect refined AMI -> GigaComputingAMI from the system/chassis
             // Manufacturer, which the raw service-root string cannot express.
             // Stamp it so callers that re-derive a vendor from /redfish/v1 see
             // the vendor this client actually dispatched on.
