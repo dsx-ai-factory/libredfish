@@ -1,0 +1,11 @@
+{
+    "@odata.id": "/redfish/v1/Systems/BlueField_0",
+    "@odata.type": "#ComputerSystem.v1_22_0.ComputerSystem",
+    "Actions": {
+        "#ComputerSystem.Reset": {
+            "target": "/redfish/v1/Systems/BlueField_0/Actions/ComputerSystem.Reset"
+        }
+    },
+    "Id": "BlueField_0",
+    "Name": "BlueField_0"
+}

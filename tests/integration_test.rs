@@ -66,6 +66,8 @@ const NVIDIA_VERA_RUBIN_PORT: &str = "8745";
 const NVIDIA_GBSWITCH_PORT: &str = "8742";
 const LITEON_POWERSHELF_PORT: &str = "8743";
 const DELTA_POWERSHELF_PORT: &str = "8744";
+const NVIDIA_DPU_FORCE_RESET_PORT: &str = "8746";
+const NVIDIA_DPU_STALE_FORCE_RESET_PORT: &str = "8747";
 
 static SETUP: Once = Once::new();
 
@@ -182,6 +184,60 @@ async fn test_delta_powershelf() -> Result<(), anyhow::Error> {
     run_integration_test("delta_powershelf", DELTA_POWERSHELF_PORT).await
 }
 
+#[tokio::test]
+async fn test_nvidia_dpu_force_reset() -> Result<(), anyhow::Error> {
+    let _mockup_server =
+        match run_mockup_server("nvidia_dpu_force_reset", NVIDIA_DPU_FORCE_RESET_PORT) {
+            Ok(server) => server,
+            Err(error) => {
+                tracing::info!("Skipping integration test, env error {error}");
+                return Ok(());
+            }
+        };
+    let endpoint = libredfish::Endpoint {
+        host: format!("127.0.0.1:{NVIDIA_DPU_FORCE_RESET_PORT}"),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let redfish = pool.create_client(endpoint).await?;
+
+    redfish
+        .power(libredfish::SystemPowerControl::ForceRestart)
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_nvidia_dpu_stale_force_reset_falls_back() -> Result<(), anyhow::Error> {
+    let _mockup_server = match run_mockup_server(
+        "nvidia_dpu_stale_force_reset",
+        NVIDIA_DPU_STALE_FORCE_RESET_PORT,
+    ) {
+        Ok(server) => server,
+        Err(error) => {
+            tracing::info!("Skipping integration test, env error {error}");
+            return Ok(());
+        }
+    };
+    let endpoint = libredfish::Endpoint {
+        host: format!("127.0.0.1:{NVIDIA_DPU_STALE_FORCE_RESET_PORT}"),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let redfish = pool.create_client(endpoint).await?;
+
+    redfish
+        .power(libredfish::SystemPowerControl::ForceRestart)
+        .await?;
+
+    Ok(())
+}
+
 async fn nvidia_dpu_integration_test(redfish: &dyn Redfish) -> Result<(), anyhow::Error> {
     let vendor = redfish.get_service_root().await?.vendor;
     assert!(vendor.is_some() && vendor.unwrap() == "Nvidia");
@@ -238,6 +294,12 @@ async fn nvidia_dpu_integration_test(redfish: &dyn Redfish) -> Result<(), anyhow
         chassis.serial_number.as_ref().unwrap().trim(),
         system.serial_number.as_ref().unwrap().trim()
     );
+
+    // BlueField-3 has no chassis whose ID matches the ComputerSystem ID, so
+    // ForceRestart must retain the standard ComputerSystem.Reset fallback.
+    redfish
+        .power(libredfish::SystemPowerControl::ForceRestart)
+        .await?;
 
     let certificates = redfish.get_secure_boot_certificates("db").await?;
     assert!(!certificates.is_empty());

@@ -1,0 +1,9 @@
+{
+    "@odata.id": "/redfish/v1/Systems",
+    "@odata.type": "#ComputerSystemCollection.ComputerSystemCollection",
+    "Members": [
+        {
+            "@odata.id": "/redfish/v1/Systems/BlueField_0"
+        }
+    ]
+}
