@@ -1,5 +1,5 @@
 {
-    "match_request_body_contains": "QuietBoot",
+    "match_request_body_contains": ["QuietBoot", "PendingOperation"],
     "status": 405,
     "headers": {
         "Content-Type": "application/json"

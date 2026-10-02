@@ -467,7 +467,8 @@ impl Redfish for Bmc {
             };
 
             let body = HashMap::from([("Attributes", HashMap::from([(name, "TPM Clear")]))]);
-            let url = format!("Systems/{}/Bios", self.s.system_id());
+            let bios = self.s.bios().await?;
+            let url = bios_settings_path(&bios, self.s.system_id());
             self.s.client.patch(&url, body).await.map(|_status_code| ())
         })
     }

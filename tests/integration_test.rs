@@ -488,8 +488,7 @@ async fn run_integration_test(
         assert!(redfish.serial_console_status().await?.is_fully_enabled());
     }
 
-    if vendor_dir != "supermicro"
-        && vendor_dir != "nvidia_gh200"
+    if vendor_dir != "nvidia_gh200"
         && vendor_dir != "nvidia_gb200"
         && vendor_dir != "nvidia_vera_rubin"
         && vendor_dir != "nvidia_gbswitch"
