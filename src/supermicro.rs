@@ -56,6 +56,19 @@ const MIN_BMC_FW_IPMI_HOST_IFACE: &str = "01.05.01";
 const HARD_DISK: &str = "UEFI Hard Disk";
 const NETWORK: &str = "UEFI Network";
 
+fn bios_settings_path(bios: &HashMap<String, serde_json::Value>, system_id: &str) -> String {
+    bios.get("@Redfish.Settings")
+        .and_then(|settings| settings.get("SettingsObject"))
+        .and_then(|settings_object| settings_object.get("@odata.id"))
+        .and_then(serde_json::Value::as_str)
+        .map(|path| {
+            path.strip_prefix("/redfish/v1/")
+                .unwrap_or(path)
+                .to_string()
+        })
+        .unwrap_or_else(|| format!("Systems/{system_id}/Bios"))
+}
+
 fn usable_standard_boot_order(boot_order: Vec<String>) -> Option<Vec<String>> {
     (!boot_order.is_empty()).then_some(boot_order)
 }
@@ -205,7 +218,8 @@ impl Redfish for Bmc {
             let mut attrs = HashMap::new();
             attrs.extend(bios_attrs);
             let body = HashMap::from([("Attributes", attrs)]);
-            let url = format!("Systems/{}/Bios", self.s.system_id());
+            let bios = self.s.bios().await?;
+            let url = bios_settings_path(&bios, self.s.system_id());
             self.s
                 .client
                 .patch(&url, body)
@@ -1310,6 +1324,7 @@ impl UpdateParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn boot_option(reference: &str, display_name: &str) -> BootOption {
         BootOption {
@@ -1406,6 +1421,25 @@ mod tests {
     #[test]
     fn empty_standard_boot_order_is_not_usable() {
         assert!(usable_standard_boot_order(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn machine_setup_uses_advertised_bios_settings_path() {
+        let bios = serde_json::from_value(json!({
+            "@Redfish.Settings": {
+                "SettingsObject": {
+                    "@odata.id": "/redfish/v1/Systems/1/Bios/SD"
+                }
+            }
+        }))
+        .expect("valid BIOS response");
+
+        assert_eq!(bios_settings_path(&bios, "1"), "Systems/1/Bios/SD");
+    }
+
+    #[test]
+    fn machine_setup_falls_back_to_active_bios_path() {
+        assert_eq!(bios_settings_path(&HashMap::new(), "1"), "Systems/1/Bios");
     }
 
     #[test]

@@ -27,7 +27,7 @@
 ///
 /// See tests/mockup/README for details.
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     path::PathBuf,
     process::{Child, Command},
@@ -44,7 +44,7 @@ use libredfish::{
         resource::{IsResource, ResourceCollection},
         Manager,
     },
-    Chassis, EthernetInterface, NetworkAdapter, PCIeDevice, Redfish,
+    BiosProfileType, Chassis, EthernetInterface, NetworkAdapter, PCIeDevice, Redfish,
 };
 use tracing::debug;
 
@@ -421,6 +421,13 @@ async fn run_integration_test(
         && vendor_dir != "delta_powershelf"
     {
         assert!(redfish.bios().await?.len() > 8);
+    }
+
+    if vendor_dir == "supermicro" {
+        let profiles = HashMap::new();
+        redfish
+            .machine_setup(None, &profiles, BiosProfileType::Performance, &profiles)
+            .await?;
     }
 
     // Exercise vendor-specific BIOS reset dispatch. The mock server validates
