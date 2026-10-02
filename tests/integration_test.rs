@@ -498,6 +498,9 @@ async fn run_integration_test(
         redfish.clear_tpm().await?;
         // The mockup includes TPM clear pending operation
         assert!(!redfish.pending().await?.is_empty());
+        if vendor_dir == "supermicro" {
+            redfish.clear_pending().await?;
+        }
     }
     if vendor_dir != "delta_powershelf" {
         redfish

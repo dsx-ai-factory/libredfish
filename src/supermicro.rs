@@ -61,12 +61,20 @@ fn bios_settings_path(bios: &HashMap<String, serde_json::Value>, system_id: &str
         .and_then(|settings| settings.get("SettingsObject"))
         .and_then(|settings_object| settings_object.get("@odata.id"))
         .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
         .map(|path| {
             path.strip_prefix("/redfish/v1/")
                 .unwrap_or(path)
                 .to_string()
         })
         .unwrap_or_else(|| format!("Systems/{system_id}/Bios"))
+}
+
+fn bios_attributes<'a>(
+    bios: &'a HashMap<String, serde_json::Value>,
+    system_id: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, RedfishError> {
+    crate::jsonmap::get_object(bios, "Attributes", &format!("Systems/{system_id}/Bios"))
 }
 
 fn usable_standard_boot_order(boot_order: Vec<String>) -> Option<Vec<String>> {
@@ -214,11 +222,12 @@ impl Redfish for Bmc {
         Box::pin(async move {
             self.setup_serial_console().await?;
 
-            let bios_attrs = self.machine_setup_attrs().await?;
+            let bios = self.s.bios().await?;
+            let bios_attrs =
+                Self::machine_setup_attrs(bios_attributes(&bios, self.s.system_id())?)?;
             let mut attrs = HashMap::new();
             attrs.extend(bios_attrs);
             let body = HashMap::from([("Attributes", attrs)]);
-            let bios = self.s.bios().await?;
             let url = bios_settings_path(&bios, self.s.system_id());
             self.s
                 .client
@@ -450,14 +459,8 @@ impl Redfish for Bmc {
     /// TODO: Verify that this really clear the TPM.
     fn clear_tpm<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
-            let bios_attrs = self.s.bios_attributes().await?;
-            let Some(attrs_map) = bios_attrs.as_object() else {
-                return Err(RedfishError::InvalidKeyType {
-                    key: "Attributes".to_string(),
-                    expected_type: "Map".to_string(),
-                    url: String::new(),
-                });
-            };
+            let bios = self.s.bios().await?;
+            let attrs_map = bios_attributes(&bios, self.s.system_id())?;
 
             // Yes the BIOS attribute to clear the TPM is called "PendingOperation<something>"
             let Some(name) = attrs_map.keys().find(|k| k.starts_with("PendingOperation")) else {
@@ -467,7 +470,6 @@ impl Redfish for Bmc {
             };
 
             let body = HashMap::from([("Attributes", HashMap::from([(name, "TPM Clear")]))]);
-            let bios = self.s.bios().await?;
             let url = bios_settings_path(&bios, self.s.system_id());
             self.s.client.patch(&url, body).await.map(|_status_code| ())
         })
@@ -477,7 +479,8 @@ impl Redfish for Bmc {
         &'a self,
     ) -> crate::RedfishFuture<'a, Result<HashMap<String, serde_json::Value>, RedfishError>> {
         Box::pin(async move {
-            let url = format!("Systems/{}/Bios/SD", self.s.system_id());
+            let bios = self.s.bios().await?;
+            let url = bios_settings_path(&bios, self.s.system_id());
             // Supermicro doesn't include the Attributes key if there are no pending changes
             self.s
                 .pending_attributes(&url)
@@ -497,7 +500,8 @@ impl Redfish for Bmc {
     // but DOES NOT CLEAR THEM. We don't know how to do that, or if Supermicro supports it at all.
     fn clear_pending<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
-            let url = format!("Systems/{}/Bios/SD", self.s.system_id());
+            let bios = self.s.bios().await?;
+            let url = bios_settings_path(&bios, self.s.system_id());
             self.s.clear_pending_with_url(&url).await
         })
     }
@@ -733,10 +737,11 @@ impl Bmc {
             });
         }
 
-        let bios = self.s.bios_attributes().await?;
-        let expected_attrs = self.machine_setup_attrs().await?;
+        let bios = self.s.bios().await?;
+        let bios_attrs = bios_attributes(&bios, self.s.system_id())?;
+        let expected_attrs = Self::machine_setup_attrs(bios_attrs)?;
         for (key, expected) in expected_attrs {
-            let Some(actual) = bios.get(&key) else {
+            let Some(actual) = bios_attrs.get(&key) else {
                 diffs.push(MachineSetupDiff {
                     key: key.to_string(),
                     expected: expected.to_string(),
@@ -810,8 +815,10 @@ impl Bmc {
         ))
     }
 
-    async fn machine_setup_attrs(&self) -> Result<Vec<(String, serde_json::Value)>, RedfishError> {
-        let mut bios_keys = self.bios_attributes_name_map().await?;
+    fn machine_setup_attrs(
+        current_attrs: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Vec<(String, serde_json::Value)>, RedfishError> {
+        let mut bios_keys = Self::bios_attributes_name_map(current_attrs);
         let mut bios_attrs: Vec<(String, serde_json::Value)> = vec![];
 
         macro_rules! add_keys {
@@ -846,16 +853,13 @@ impl Bmc {
         add_keys!("IPv6PXESupport", EnabledDisabled::Disabled);
 
         // Enable TPM - check current format and use matching enum
-        let current_attrs = self.s.bios_attributes().await?;
         let tpm_value = current_attrs
-            .as_object()
-            .and_then(|attrs| {
-                attrs.iter().find(|(key, _)| {
-                    key.split('_')
-                        .next()
-                        .unwrap_or(key)
-                        .starts_with("SecurityDeviceSupport")
-                })
+            .iter()
+            .find(|(key, _)| {
+                key.split('_')
+                    .next()
+                    .unwrap_or(key)
+                    .starts_with("SecurityDeviceSupport")
             })
             .and_then(|(_, value)| value.as_str());
 
@@ -1197,16 +1201,9 @@ impl Bmc {
     // BIOS attribute names by their canonical name.
     // e.g. QuietBoot -> [QuietBoot_002E]
     //      TXTSupport -> [TXTSupport_0062, TXTSupport_0072]
-    async fn bios_attributes_name_map(&self) -> Result<HashMap<String, Vec<String>>, RedfishError> {
-        let bios_attrs = self.s.bios_attributes().await?;
-
-        let Some(attrs_map) = bios_attrs.as_object() else {
-            return Err(RedfishError::InvalidKeyType {
-                key: "Attributes".to_string(),
-                expected_type: "Map".to_string(),
-                url: String::new(),
-            });
-        };
+    fn bios_attributes_name_map(
+        attrs_map: &serde_json::Map<String, serde_json::Value>,
+    ) -> HashMap<String, Vec<String>> {
         let mut by_name: HashMap<String, Vec<String>> = HashMap::with_capacity(attrs_map.len());
         for k in attrs_map.keys() {
             let clean_key = k
@@ -1218,7 +1215,7 @@ impl Bmc {
                 .and_modify(|e| e.push(k.clone()))
                 .or_insert(vec![k.clone()]);
         }
-        Ok(by_name)
+        by_name
     }
 
     /// MGX C2 systems use SSIF instead of x86 KCS, so the KCSInterface
@@ -1425,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_setup_uses_advertised_bios_settings_path() {
+    fn bios_settings_path_uses_advertised_path() {
         let bios = serde_json::from_value(json!({
             "@Redfish.Settings": {
                 "SettingsObject": {
@@ -1439,8 +1436,14 @@ mod tests {
     }
 
     #[test]
-    fn machine_setup_falls_back_to_active_bios_path() {
+    fn bios_settings_path_falls_back_to_active_path() {
         assert_eq!(bios_settings_path(&HashMap::new(), "1"), "Systems/1/Bios");
+
+        let bios = serde_json::from_value(json!({
+            "@Redfish.Settings": {"SettingsObject": {"@odata.id": ""}}
+        }))
+        .expect("valid BIOS response");
+        assert_eq!(bios_settings_path(&bios, "1"), "Systems/1/Bios");
     }
 
     #[test]
