@@ -56,7 +56,7 @@ const MIN_BMC_FW_IPMI_HOST_IFACE: &str = "01.05.01";
 const HARD_DISK: &str = "UEFI Hard Disk";
 const NETWORK: &str = "UEFI Network";
 
-fn bios_settings_path(bios: &HashMap<String, serde_json::Value>, system_id: &str) -> String {
+fn bios_settings_path(bios: &HashMap<String, serde_json::Value>, fallback: String) -> String {
     bios.get("@Redfish.Settings")
         .and_then(|settings| settings.get("SettingsObject"))
         .and_then(|settings_object| settings_object.get("@odata.id"))
@@ -67,7 +67,7 @@ fn bios_settings_path(bios: &HashMap<String, serde_json::Value>, system_id: &str
                 .unwrap_or(path)
                 .to_string()
         })
-        .unwrap_or_else(|| format!("Systems/{system_id}/Bios"))
+        .unwrap_or(fallback)
 }
 
 fn bios_attributes<'a>(
@@ -228,7 +228,7 @@ impl Redfish for Bmc {
             let mut attrs = HashMap::new();
             attrs.extend(bios_attrs);
             let body = HashMap::from([("Attributes", attrs)]);
-            let url = bios_settings_path(&bios, self.s.system_id());
+            let url = bios_settings_path(&bios, format!("Systems/{}/Bios", self.s.system_id()));
             self.s
                 .client
                 .patch(&url, body)
@@ -470,7 +470,7 @@ impl Redfish for Bmc {
             };
 
             let body = HashMap::from([("Attributes", HashMap::from([(name, "TPM Clear")]))]);
-            let url = bios_settings_path(&bios, self.s.system_id());
+            let url = bios_settings_path(&bios, format!("Systems/{}/Bios", self.s.system_id()));
             self.s.client.patch(&url, body).await.map(|_status_code| ())
         })
     }
@@ -480,7 +480,7 @@ impl Redfish for Bmc {
     ) -> crate::RedfishFuture<'a, Result<HashMap<String, serde_json::Value>, RedfishError>> {
         Box::pin(async move {
             let bios = self.s.bios().await?;
-            let url = bios_settings_path(&bios, self.s.system_id());
+            let url = bios_settings_path(&bios, format!("Systems/{}/Bios/SD", self.s.system_id()));
             // Supermicro doesn't include the Attributes key if there are no pending changes
             self.s
                 .pending_attributes(&url)
@@ -501,7 +501,7 @@ impl Redfish for Bmc {
     fn clear_pending<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
             let bios = self.s.bios().await?;
-            let url = bios_settings_path(&bios, self.s.system_id());
+            let url = bios_settings_path(&bios, format!("Systems/{}/Bios/SD", self.s.system_id()));
             self.s.clear_pending_with_url(&url).await
         })
     }
@@ -1432,18 +1432,27 @@ mod tests {
         }))
         .expect("valid BIOS response");
 
-        assert_eq!(bios_settings_path(&bios, "1"), "Systems/1/Bios/SD");
+        assert_eq!(
+            bios_settings_path(&bios, "Systems/1/Bios".to_string()),
+            "Systems/1/Bios/SD"
+        );
     }
 
     #[test]
-    fn bios_settings_path_falls_back_to_active_path() {
-        assert_eq!(bios_settings_path(&HashMap::new(), "1"), "Systems/1/Bios");
+    fn bios_settings_path_uses_requested_fallback() {
+        assert_eq!(
+            bios_settings_path(&HashMap::new(), "Systems/1/Bios/SD".to_string()),
+            "Systems/1/Bios/SD"
+        );
 
         let bios = serde_json::from_value(json!({
             "@Redfish.Settings": {"SettingsObject": {"@odata.id": ""}}
         }))
         .expect("valid BIOS response");
-        assert_eq!(bios_settings_path(&bios, "1"), "Systems/1/Bios");
+        assert_eq!(
+            bios_settings_path(&bios, "Systems/1/Bios".to_string()),
+            "Systems/1/Bios"
+        );
     }
 
     #[test]
