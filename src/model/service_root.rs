@@ -35,6 +35,8 @@ use crate::model;
 pub struct ServiceRoot {
     #[serde(flatten)]
     pub odata: OData,
+    pub id: Option<String>,
+    pub name: Option<String>,
     pub product: Option<String>,
     pub redfish_version: String,
     pub vendor: Option<String>,
@@ -89,10 +91,28 @@ impl ServiceRoot {
     pub fn vendor_string(&self) -> Option<String> {
         // If there is no "Vendor" key in ServiceRoot, look for an "Oem" entry. It will have a
         // single key which is the vendor name.
-        self.vendor.as_ref().cloned().or_else(|| match &self.oem {
-            Some(oem) => oem.keys().next().cloned(),
-            None => None,
-        })
+        self.vendor
+            .as_ref()
+            .cloned()
+            .or_else(|| match &self.oem {
+                Some(oem) => oem.keys().next().cloned(),
+                None => None,
+            })
+            .or_else(|| {
+                // Stock Sushy emulator has no Vendor or Oem fields but uses
+                // "RedvirtService" as its Id. Detect it from Id and Name so
+                // auto-detection works without a custom root.json template.
+                let haystack = [self.id.as_deref(), self.name.as_deref()];
+                let is_sushy = haystack.iter().flatten().any(|s| {
+                    let lower = s.to_lowercase();
+                    lower.contains("sushy") || lower.contains("redvirt")
+                });
+                if is_sushy {
+                    Some("Sushy".to_string())
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn vendor(&self) -> Option<RedfishVendor> {
@@ -211,5 +231,44 @@ mod test {
             ..Default::default()
         };
         assert_eq!(result.vendor().unwrap(), RedfishVendor::DeltaPowerShelf);
+    }
+
+    #[test]
+    fn test_sushy_detected_from_vendor_field() {
+        let result = ServiceRoot {
+            vendor: Some("Sushy".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::Sushy);
+    }
+
+    #[test]
+    fn test_sushy_detected_from_id_fallback() {
+        // Stock Sushy 2.2.0 has no Vendor field but uses "RedvirtService" as Id.
+        let result = ServiceRoot {
+            id: Some("RedvirtService".to_string()),
+            name: Some("Redvirt Service".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::Sushy);
+    }
+
+    #[test]
+    fn test_sushy_detected_from_name_fallback() {
+        let result = ServiceRoot {
+            name: Some("Sushy Service".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::Sushy);
+    }
+
+    #[test]
+    fn test_sushy_detected_from_name_when_id_is_generic() {
+        let result = ServiceRoot {
+            id: Some("RootService".to_string()),
+            name: Some("Redvirt Service".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::Sushy);
     }
 }

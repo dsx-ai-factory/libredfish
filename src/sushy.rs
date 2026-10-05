@@ -32,6 +32,7 @@
 //! The aliases "Contoso" and "Redvirt" are also accepted.
 
 use crate::Assembly;
+use reqwest::StatusCode;
 use std::{collections::HashMap, path::Path, time::Duration};
 use tokio::fs::File;
 use tracing::info;
@@ -182,11 +183,27 @@ impl Redfish for Bmc {
         &'a self,
     ) -> crate::RedfishFuture<'a, Result<crate::Status, RedfishError>> {
         Box::pin(async move {
-            info!("Sushy: reporting lockdown as enabled (emulator)");
-            Ok(crate::Status {
-                status: crate::StatusInternal::Enabled,
-                message: "Sushy emulator".to_string(),
-            })
+            Err(RedfishError::NotSupported(
+                "lockdown_status".to_string(),
+            ))
+        })
+    }
+
+    fn get_software_inventories<'a>(
+        &'a self,
+    ) -> crate::RedfishFuture<'a, Result<Vec<String>, RedfishError>> {
+        Box::pin(async move {
+            match self.standard.get_software_inventories().await {
+                Ok(v) => Ok(v),
+                Err(RedfishError::HTTPErrorCode { status_code, .. })
+                    if status_code == StatusCode::NOT_FOUND =>
+                {
+                    Err(RedfishError::NotSupported(
+                        "FirmwareInventory".to_string(),
+                    ))
+                }
+                Err(e) => Err(e),
+            }
         })
     }
 
