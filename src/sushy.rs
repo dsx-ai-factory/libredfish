@@ -182,11 +182,7 @@ impl Redfish for Bmc {
     fn lockdown_status<'a>(
         &'a self,
     ) -> crate::RedfishFuture<'a, Result<crate::Status, RedfishError>> {
-        Box::pin(async move {
-            Err(RedfishError::NotSupported(
-                "lockdown_status".to_string(),
-            ))
-        })
+        Box::pin(async move { Err(RedfishError::NotSupported("lockdown_status".to_string())) })
     }
 
     fn get_software_inventories<'a>(
@@ -198,9 +194,7 @@ impl Redfish for Bmc {
                 Err(RedfishError::HTTPErrorCode { status_code, .. })
                     if status_code == StatusCode::NOT_FOUND =>
                 {
-                    Err(RedfishError::NotSupported(
-                        "FirmwareInventory".to_string(),
-                    ))
+                    Err(RedfishError::NotSupported("FirmwareInventory".to_string()))
                 }
                 Err(e) => Err(e),
             }
