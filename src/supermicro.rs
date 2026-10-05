@@ -842,7 +842,14 @@ impl Bmc {
         // Attributes to enable CPU virtualization support for faster VMs
         // Not that some are "Enable" and some are "Enabled". Subtle.
         add_keys!("IntelVTforDirectedI/O(VT-d)", EnableDisable::Enable);
-        add_keys!("IntelVirtualizationTechnology", EnableDisable::Enable);
+        let intel_virtualization_value = bios_keys
+            .get("IntelVirtualizationTechnology")
+            .into_iter()
+            .flatten()
+            .filter_map(|key| current_attrs.get(key)?.as_str())
+            .find(|value| matches!(*value, "Enabled" | "Disabled"))
+            .map_or("Enable", |_| "Enabled");
+        add_keys!("IntelVirtualizationTechnology", intel_virtualization_value);
         add_keys!("SR-IOVSupport", EnabledDisabled::Enabled);
         add_keys!("SR_IOVSupport", EnabledDisabled::Enabled);
 
@@ -1453,6 +1460,31 @@ mod tests {
             bios_settings_path(&bios, "Systems/1/Bios".to_string()),
             "Systems/1/Bios"
         );
+    }
+
+    #[test]
+    fn machine_setup_preserves_intel_virtualization_value_vocabulary() {
+        for (current, expected) in [
+            ("Enabled", "Enabled"),
+            ("Disabled", "Enabled"),
+            ("Enable", "Enable"),
+            ("Disable", "Enable"),
+        ] {
+            let attrs = json!({
+                "IntelVirtualizationTechnology": current,
+                "SecurityDeviceSupport": "Enabled"
+            });
+            let attrs = attrs.as_object().expect("BIOS attributes object");
+            let setup = Bmc::machine_setup_attrs(attrs).expect("valid BIOS attributes");
+
+            assert_eq!(
+                setup
+                    .iter()
+                    .find(|(key, _)| key == "IntelVirtualizationTechnology")
+                    .map(|(_, value)| value),
+                Some(&json!(expected))
+            );
+        }
     }
 
     #[test]
