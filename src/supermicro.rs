@@ -223,10 +223,11 @@ impl Redfish for Bmc {
             self.setup_serial_console().await?;
 
             let bios = self.s.bios().await?;
-            let bios_attrs =
-                Self::machine_setup_attrs(bios_attributes(&bios, self.s.system_id())?)?;
-            let mut attrs = HashMap::new();
-            attrs.extend(bios_attrs);
+            let attrs =
+                Self::changed_machine_setup_attrs(bios_attributes(&bios, self.s.system_id())?)?;
+            if attrs.is_empty() {
+                return Ok(None);
+            }
             let body = HashMap::from([("Attributes", attrs)]);
             let url = bios_settings_path(&bios, format!("Systems/{}/Bios", self.s.system_id()));
             self.s
@@ -893,6 +894,15 @@ impl Bmc {
         Ok(bios_attrs)
     }
 
+    fn changed_machine_setup_attrs(
+        current_attrs: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<HashMap<String, serde_json::Value>, RedfishError> {
+        Ok(Self::machine_setup_attrs(current_attrs)?
+            .into_iter()
+            .filter(|(key, expected)| current_attrs.get(key) != Some(expected))
+            .collect())
+    }
+
     async fn get_kcs_privilege(&self) -> Result<Option<supermicro::Privilege>, RedfishError> {
         if self.is_mgx_c2().await? {
             if !self.bmc_supports_ipmi_host_iface().await? {
@@ -1485,6 +1495,35 @@ mod tests {
                 Some(&json!(expected))
             );
         }
+    }
+
+    #[test]
+    fn machine_setup_only_writes_changed_bios_attributes() {
+        let attrs = json!({
+            "IPv4HTTPSupport": "Disabled",
+            "IPv4PXESupport": "Enabled",
+            "IPv6HTTPSupport": "Disabled",
+            "IPv6PXESupport": "Enabled",
+            "IntelVirtualizationTechnology": "Enabled",
+            "QuietBoot": true,
+            "SecureBootEnable": false,
+            "SecurityDeviceSupport": "Enabled",
+            "TXTSupport": "Disabled"
+        });
+        let changed =
+            Bmc::changed_machine_setup_attrs(attrs.as_object().expect("BIOS attributes object"))
+                .expect("valid BIOS attributes");
+
+        assert_eq!(
+            changed,
+            HashMap::from([
+                ("IPv4HTTPSupport".to_string(), json!("Enabled")),
+                ("IPv4PXESupport".to_string(), json!("Disabled")),
+                ("IPv6PXESupport".to_string(), json!("Disabled")),
+                ("QuietBoot".to_string(), json!(false)),
+                ("TXTSupport".to_string(), json!("Enabled")),
+            ])
+        );
     }
 
     #[test]
