@@ -28,9 +28,9 @@ use serde_with::DefaultOnNull;
 
 use super::{boot::Boot, oem::SystemExtensions, OData, ODataId, ODataLinks, RedfishSettings};
 
-const MELLANOX_VENDOR_ID_HEX: &str = "0X15B3";
+pub(crate) const MELLANOX_VENDOR_ID_HEX: &str = "0X15B3";
 const MELLANOX_VENDOR_ID_DEC: &str = "5555";
-const MELLANOX_DPU_DEVICE_IDS_HEX: [&str; 5] = [
+pub(crate) const MELLANOX_DPU_DEVICE_IDS_HEX: [&str; 5] = [
     "0XA2DF", // BF4 Family integrated network controller [BlueField-4 integrated network controller]
     "0XA2D9", // MT43162 BlueField-3 Lx integrated ConnectX-7 network controller
     "0XA2DC", // MT43244 BlueField-3 integrated ConnectX-7 network controller
