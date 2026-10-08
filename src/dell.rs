@@ -1072,6 +1072,11 @@ impl Bmc {
         }
 
         diff!(
+            "BootSeqRetry",
+            expected_attrs.boot_seq_retry,
+            EnabledDisabled
+        );
+        diff!(
             "InBandManageabilityInterface",
             expected_attrs.in_band_manageability_interface,
             EnabledDisabled
@@ -1805,6 +1810,7 @@ impl Bmc {
         };
 
         Ok(dell::MachineBiosAttrs {
+            boot_seq_retry: EnabledDisabled::Enabled,
             in_band_manageability_interface: EnabledDisabled::Disabled,
             uefi_variable_access: dell::UefiVariableAccessSettings::Standard,
             serial_comm,
