@@ -27,7 +27,7 @@
 ///
 /// See tests/mockup/README for details.
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     path::PathBuf,
     process::{Child, Command},
@@ -44,7 +44,7 @@ use libredfish::{
         resource::{IsResource, ResourceCollection},
         Manager,
     },
-    Chassis, EthernetInterface, NetworkAdapter, PCIeDevice, Redfish,
+    BiosProfileType, Chassis, EthernetInterface, NetworkAdapter, PCIeDevice, Redfish,
 };
 use tracing::debug;
 
@@ -423,6 +423,13 @@ async fn run_integration_test(
         assert!(redfish.bios().await?.len() > 8);
     }
 
+    if vendor_dir == "supermicro" {
+        let profiles = HashMap::new();
+        redfish
+            .machine_setup(None, &profiles, BiosProfileType::Performance, &profiles)
+            .await?;
+    }
+
     // Exercise vendor-specific BIOS reset dispatch. The mock server validates
     // that the target resource or action exists, but does not apply the reset.
     if matches!(
@@ -481,8 +488,7 @@ async fn run_integration_test(
         assert!(redfish.serial_console_status().await?.is_fully_enabled());
     }
 
-    if vendor_dir != "supermicro"
-        && vendor_dir != "nvidia_gh200"
+    if vendor_dir != "nvidia_gh200"
         && vendor_dir != "nvidia_gb200"
         && vendor_dir != "nvidia_vera_rubin"
         && vendor_dir != "nvidia_gbswitch"
@@ -492,6 +498,9 @@ async fn run_integration_test(
         redfish.clear_tpm().await?;
         // The mockup includes TPM clear pending operation
         assert!(!redfish.pending().await?.is_empty());
+        if vendor_dir == "supermicro" {
+            redfish.clear_pending().await?;
+        }
     }
     if vendor_dir != "delta_powershelf" {
         redfish

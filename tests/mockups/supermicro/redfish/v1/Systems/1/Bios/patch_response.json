@@ -1,0 +1,8 @@
+{
+    "match_request_body_contains": ["QuietBoot", "PendingOperation"],
+    "status": 405,
+    "headers": {
+        "Content-Type": "application/json"
+    },
+    "body": "{\"error\":{\"code\":\"Base.1.8.1.MalformedJSON\",\"message\":\"Method Not Allowed\"}}"
+}

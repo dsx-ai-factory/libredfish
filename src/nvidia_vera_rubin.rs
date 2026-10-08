@@ -938,7 +938,7 @@ impl Redfish for Bmc {
                     }
                 }
             });
-            let url = format!("Chassis/CX_{nic_index}/NetworkAdapters/CX_NIC_{nic_index}/Settings");
+            let url = format!("Chassis/CX_{nic_index}/NetworkAdapters/NIC_0/Settings");
             self.s.client.patch(&url, &body).await?;
             Ok(())
         })

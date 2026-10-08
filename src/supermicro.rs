@@ -56,6 +56,27 @@ const MIN_BMC_FW_IPMI_HOST_IFACE: &str = "01.05.01";
 const HARD_DISK: &str = "UEFI Hard Disk";
 const NETWORK: &str = "UEFI Network";
 
+fn bios_settings_path(bios: &HashMap<String, serde_json::Value>, fallback: String) -> String {
+    bios.get("@Redfish.Settings")
+        .and_then(|settings| settings.get("SettingsObject"))
+        .and_then(|settings_object| settings_object.get("@odata.id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            path.strip_prefix("/redfish/v1/")
+                .unwrap_or(path)
+                .to_string()
+        })
+        .unwrap_or(fallback)
+}
+
+fn bios_attributes<'a>(
+    bios: &'a HashMap<String, serde_json::Value>,
+    system_id: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, RedfishError> {
+    crate::jsonmap::get_object(bios, "Attributes", &format!("Systems/{system_id}/Bios"))
+}
+
 fn usable_standard_boot_order(boot_order: Vec<String>) -> Option<Vec<String>> {
     (!boot_order.is_empty()).then_some(boot_order)
 }
@@ -201,11 +222,14 @@ impl Redfish for Bmc {
         Box::pin(async move {
             self.setup_serial_console().await?;
 
-            let bios_attrs = self.machine_setup_attrs().await?;
-            let mut attrs = HashMap::new();
-            attrs.extend(bios_attrs);
+            let bios = self.s.bios().await?;
+            let attrs =
+                Self::changed_machine_setup_attrs(bios_attributes(&bios, self.s.system_id())?)?;
+            if attrs.is_empty() {
+                return Ok(None);
+            }
             let body = HashMap::from([("Attributes", attrs)]);
-            let url = format!("Systems/{}/Bios", self.s.system_id());
+            let url = bios_settings_path(&bios, format!("Systems/{}/Bios", self.s.system_id()));
             self.s
                 .client
                 .patch(&url, body)
@@ -436,14 +460,8 @@ impl Redfish for Bmc {
     /// TODO: Verify that this really clear the TPM.
     fn clear_tpm<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
-            let bios_attrs = self.s.bios_attributes().await?;
-            let Some(attrs_map) = bios_attrs.as_object() else {
-                return Err(RedfishError::InvalidKeyType {
-                    key: "Attributes".to_string(),
-                    expected_type: "Map".to_string(),
-                    url: String::new(),
-                });
-            };
+            let bios = self.s.bios().await?;
+            let attrs_map = bios_attributes(&bios, self.s.system_id())?;
 
             // Yes the BIOS attribute to clear the TPM is called "PendingOperation<something>"
             let Some(name) = attrs_map.keys().find(|k| k.starts_with("PendingOperation")) else {
@@ -453,7 +471,7 @@ impl Redfish for Bmc {
             };
 
             let body = HashMap::from([("Attributes", HashMap::from([(name, "TPM Clear")]))]);
-            let url = format!("Systems/{}/Bios", self.s.system_id());
+            let url = bios_settings_path(&bios, format!("Systems/{}/Bios", self.s.system_id()));
             self.s.client.patch(&url, body).await.map(|_status_code| ())
         })
     }
@@ -462,7 +480,8 @@ impl Redfish for Bmc {
         &'a self,
     ) -> crate::RedfishFuture<'a, Result<HashMap<String, serde_json::Value>, RedfishError>> {
         Box::pin(async move {
-            let url = format!("Systems/{}/Bios/SD", self.s.system_id());
+            let bios = self.s.bios().await?;
+            let url = bios_settings_path(&bios, format!("Systems/{}/Bios/SD", self.s.system_id()));
             // Supermicro doesn't include the Attributes key if there are no pending changes
             self.s
                 .pending_attributes(&url)
@@ -482,7 +501,8 @@ impl Redfish for Bmc {
     // but DOES NOT CLEAR THEM. We don't know how to do that, or if Supermicro supports it at all.
     fn clear_pending<'a>(&'a self) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
-            let url = format!("Systems/{}/Bios/SD", self.s.system_id());
+            let bios = self.s.bios().await?;
+            let url = bios_settings_path(&bios, format!("Systems/{}/Bios/SD", self.s.system_id()));
             self.s.clear_pending_with_url(&url).await
         })
     }
@@ -718,10 +738,11 @@ impl Bmc {
             });
         }
 
-        let bios = self.s.bios_attributes().await?;
-        let expected_attrs = self.machine_setup_attrs().await?;
+        let bios = self.s.bios().await?;
+        let bios_attrs = bios_attributes(&bios, self.s.system_id())?;
+        let expected_attrs = Self::machine_setup_attrs(bios_attrs)?;
         for (key, expected) in expected_attrs {
-            let Some(actual) = bios.get(&key) else {
+            let Some(actual) = bios_attrs.get(&key) else {
                 diffs.push(MachineSetupDiff {
                     key: key.to_string(),
                     expected: expected.to_string(),
@@ -795,8 +816,10 @@ impl Bmc {
         ))
     }
 
-    async fn machine_setup_attrs(&self) -> Result<Vec<(String, serde_json::Value)>, RedfishError> {
-        let mut bios_keys = self.bios_attributes_name_map().await?;
+    fn machine_setup_attrs(
+        current_attrs: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Vec<(String, serde_json::Value)>, RedfishError> {
+        let mut bios_keys = Self::bios_attributes_name_map(current_attrs);
         let mut bios_attrs: Vec<(String, serde_json::Value)> = vec![];
 
         macro_rules! add_keys {
@@ -820,7 +843,14 @@ impl Bmc {
         // Attributes to enable CPU virtualization support for faster VMs
         // Not that some are "Enable" and some are "Enabled". Subtle.
         add_keys!("IntelVTforDirectedI/O(VT-d)", EnableDisable::Enable);
-        add_keys!("IntelVirtualizationTechnology", EnableDisable::Enable);
+        let intel_virtualization_value = bios_keys
+            .get("IntelVirtualizationTechnology")
+            .into_iter()
+            .flatten()
+            .filter_map(|key| current_attrs.get(key)?.as_str())
+            .find(|value| matches!(*value, "Enabled" | "Disabled"))
+            .map_or("Enable", |_| "Enabled");
+        add_keys!("IntelVirtualizationTechnology", intel_virtualization_value);
         add_keys!("SR-IOVSupport", EnabledDisabled::Enabled);
         add_keys!("SR_IOVSupport", EnabledDisabled::Enabled);
 
@@ -831,16 +861,13 @@ impl Bmc {
         add_keys!("IPv6PXESupport", EnabledDisabled::Disabled);
 
         // Enable TPM - check current format and use matching enum
-        let current_attrs = self.s.bios_attributes().await?;
         let tpm_value = current_attrs
-            .as_object()
-            .and_then(|attrs| {
-                attrs.iter().find(|(key, _)| {
-                    key.split('_')
-                        .next()
-                        .unwrap_or(key)
-                        .starts_with("SecurityDeviceSupport")
-                })
+            .iter()
+            .find(|(key, _)| {
+                key.split('_')
+                    .next()
+                    .unwrap_or(key)
+                    .starts_with("SecurityDeviceSupport")
             })
             .and_then(|(_, value)| value.as_str());
 
@@ -865,6 +892,15 @@ impl Bmc {
         }
 
         Ok(bios_attrs)
+    }
+
+    fn changed_machine_setup_attrs(
+        current_attrs: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<HashMap<String, serde_json::Value>, RedfishError> {
+        Ok(Self::machine_setup_attrs(current_attrs)?
+            .into_iter()
+            .filter(|(key, expected)| current_attrs.get(key) != Some(expected))
+            .collect())
     }
 
     async fn get_kcs_privilege(&self) -> Result<Option<supermicro::Privilege>, RedfishError> {
@@ -1182,16 +1218,9 @@ impl Bmc {
     // BIOS attribute names by their canonical name.
     // e.g. QuietBoot -> [QuietBoot_002E]
     //      TXTSupport -> [TXTSupport_0062, TXTSupport_0072]
-    async fn bios_attributes_name_map(&self) -> Result<HashMap<String, Vec<String>>, RedfishError> {
-        let bios_attrs = self.s.bios_attributes().await?;
-
-        let Some(attrs_map) = bios_attrs.as_object() else {
-            return Err(RedfishError::InvalidKeyType {
-                key: "Attributes".to_string(),
-                expected_type: "Map".to_string(),
-                url: String::new(),
-            });
-        };
+    fn bios_attributes_name_map(
+        attrs_map: &serde_json::Map<String, serde_json::Value>,
+    ) -> HashMap<String, Vec<String>> {
         let mut by_name: HashMap<String, Vec<String>> = HashMap::with_capacity(attrs_map.len());
         for k in attrs_map.keys() {
             let clean_key = k
@@ -1203,7 +1232,7 @@ impl Bmc {
                 .and_modify(|e| e.push(k.clone()))
                 .or_insert(vec![k.clone()]);
         }
-        Ok(by_name)
+        by_name
     }
 
     /// MGX C2 systems use SSIF instead of x86 KCS, so the KCSInterface
@@ -1310,6 +1339,7 @@ impl UpdateParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn boot_option(reference: &str, display_name: &str) -> BootOption {
         BootOption {
@@ -1406,6 +1436,94 @@ mod tests {
     #[test]
     fn empty_standard_boot_order_is_not_usable() {
         assert!(usable_standard_boot_order(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn bios_settings_path_uses_advertised_path() {
+        let bios = serde_json::from_value(json!({
+            "@Redfish.Settings": {
+                "SettingsObject": {
+                    "@odata.id": "/redfish/v1/Systems/1/Bios/SD"
+                }
+            }
+        }))
+        .expect("valid BIOS response");
+
+        assert_eq!(
+            bios_settings_path(&bios, "Systems/1/Bios".to_string()),
+            "Systems/1/Bios/SD"
+        );
+    }
+
+    #[test]
+    fn bios_settings_path_uses_requested_fallback() {
+        assert_eq!(
+            bios_settings_path(&HashMap::new(), "Systems/1/Bios/SD".to_string()),
+            "Systems/1/Bios/SD"
+        );
+
+        let bios = serde_json::from_value(json!({
+            "@Redfish.Settings": {"SettingsObject": {"@odata.id": ""}}
+        }))
+        .expect("valid BIOS response");
+        assert_eq!(
+            bios_settings_path(&bios, "Systems/1/Bios".to_string()),
+            "Systems/1/Bios"
+        );
+    }
+
+    #[test]
+    fn machine_setup_preserves_intel_virtualization_value_vocabulary() {
+        for (current, expected) in [
+            ("Enabled", "Enabled"),
+            ("Disabled", "Enabled"),
+            ("Enable", "Enable"),
+            ("Disable", "Enable"),
+        ] {
+            let attrs = json!({
+                "IntelVirtualizationTechnology": current,
+                "SecurityDeviceSupport": "Enabled"
+            });
+            let attrs = attrs.as_object().expect("BIOS attributes object");
+            let setup = Bmc::machine_setup_attrs(attrs).expect("valid BIOS attributes");
+
+            assert_eq!(
+                setup
+                    .iter()
+                    .find(|(key, _)| key == "IntelVirtualizationTechnology")
+                    .map(|(_, value)| value),
+                Some(&json!(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn machine_setup_only_writes_changed_bios_attributes() {
+        let attrs = json!({
+            "IPv4HTTPSupport": "Disabled",
+            "IPv4PXESupport": "Enabled",
+            "IPv6HTTPSupport": "Disabled",
+            "IPv6PXESupport": "Enabled",
+            "IntelVirtualizationTechnology": "Enabled",
+            "QuietBoot": true,
+            "SecureBootEnable": false,
+            "SecurityDeviceSupport": "Enabled",
+            "TXTSupport": "Disabled"
+        });
+        let changed =
+            Bmc::changed_machine_setup_attrs(attrs.as_object().expect("BIOS attributes object"))
+                .expect("valid BIOS attributes");
+
+        assert_eq!(
+            changed,
+            HashMap::from([
+                ("IPv4HTTPSupport".to_string(), json!("Enabled")),
+                ("IPv4PXESupport".to_string(), json!("Disabled")),
+                ("IPv6PXESupport".to_string(), json!("Disabled")),
+                ("QuietBoot".to_string(), json!(false)),
+                ("TXTSupport".to_string(), json!("Enabled")),
+            ])
+        );
     }
 
     #[test]
