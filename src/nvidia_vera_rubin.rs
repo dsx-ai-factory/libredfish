@@ -34,6 +34,7 @@ use crate::model::component_integrity::RegexToFirmwareIdOptions;
 use crate::model::sensor::{GPUSensors, Sensor, Sensors};
 use crate::model::service_root::RedfishVendor;
 use crate::model::storage::DriveCollection;
+use crate::model::system::{MELLANOX_DPU_DEVICE_IDS_HEX, MELLANOX_VENDOR_ID_HEX};
 use crate::model::task::Task;
 use crate::model::thermal::Fan;
 use crate::model::update_service::ComponentType;
@@ -107,6 +108,32 @@ fn promote_boot_order_entry_first(
             error: format!("Boot option {target_reference} is not present in BootOrder"),
         })
     }
+}
+
+/// Remove every DPU from the OpRomDisabledDevices list
+fn op_rom_disabled_devices_without_dpus(current: &str) -> String {
+    current
+        .split_whitespace()
+        .filter(|token| !op_rom_device_is_dpu(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Strip a leading `0X` prefix from an already-uppercased hex string.
+fn strip_hex_prefix(value: &str) -> &str {
+    value.trim_start_matches("0X")
+}
+
+fn op_rom_device_is_dpu(token: &str) -> bool {
+    let upper = token.to_uppercase();
+    let normalized = strip_hex_prefix(&upper);
+    let vendor = strip_hex_prefix(MELLANOX_VENDOR_ID_HEX);
+    let Some(device) = normalized.strip_prefix(vendor) else {
+        return false;
+    };
+    MELLANOX_DPU_DEVICE_IDS_HEX
+        .iter()
+        .any(|id| strip_hex_prefix(id) == device)
 }
 
 impl BootOptionMatchField {
@@ -1136,11 +1163,25 @@ impl Bmc {
     }
 
     async fn machine_setup_attrs(&self) -> Result<Vec<(String, serde_json::Value)>, RedfishError> {
-        Ok(vec![
+        let mut attrs: Vec<(String, serde_json::Value)> = vec![
             ("TPM".into(), "Enabled".into()),
             ("EmbeddedUefiShell".into(), "Disabled".into()),
             ("GpuExposeAsPcie".into(), true.into()),
-        ])
+        ];
+
+        // we need to remove dpus from the OpRomDisabledDevices list so that host can see the DPU (and the associated boot options)
+        const OP_ROM_DISABLED_DEVICES_ATTR: &str = "OpRomDisabledDevices";
+
+        let bios = self.s.bios_attributes().await?;
+        if let Some(current) = bios
+            .get(OP_ROM_DISABLED_DEVICES_ATTR)
+            .and_then(|v| v.as_str())
+        {
+            let desired = op_rom_disabled_devices_without_dpus(current);
+            attrs.push((OP_ROM_DISABLED_DEVICES_ATTR.into(), desired.into()));
+        }
+
+        Ok(attrs)
     }
 
     // get_embedded_uefi_shell_status returns the current status of the EmbeddedUefiShell BIOS attribute.
@@ -1256,6 +1297,33 @@ mod tests {
 
         let err = promote_boot_order_entry_first(&mut boot_order, "Boot0010").unwrap_err();
         assert!(matches!(err, RedfishError::GenericError { .. }));
+    }
+
+    #[test]
+    fn op_rom_disabled_devices_removes_dpu_keeps_connectx() {
+        assert_eq!(
+            op_rom_disabled_devices_without_dpus("0x15B31023 0x15B31025 0x15B3A2DF"),
+            "0x15B31023 0x15B31025",
+        );
+    }
+
+    #[test]
+    fn op_rom_disabled_devices_removes_every_bluefield_family() {
+        assert_eq!(
+            op_rom_disabled_devices_without_dpus(
+                "0x15B3A2DF 0x15B3A2D9 0x15B3A2DC 0x15B3A2D2 0x15B3A2D6 0x15B31023"
+            ),
+            "0x15B31023",
+        );
+    }
+
+    #[test]
+    fn op_rom_device_is_dpu_matches_case_insensitively_and_vendor_scoped() {
+        assert!(op_rom_device_is_dpu("0X15b3a2df"));
+        // ConnectX device under the Mellanox vendor is not a DPU.
+        assert!(!op_rom_device_is_dpu("0x15B31023"));
+        // Same device id under a different vendor is not a DPU.
+        assert!(!op_rom_device_is_dpu("0x8086A2DF"));
     }
 
     #[test]
