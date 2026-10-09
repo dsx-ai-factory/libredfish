@@ -353,6 +353,13 @@ pub trait Redfish: Send + Sync + 'static {
         bios_profiles: &'a BiosProfileVendor,
         selected_profile: BiosProfileType,
         oem_manager_profiles: &'a BiosProfileVendor,
+        // Disable the host's onboard management NIC(s) where supported. Some
+        // platforms (e.g. VR72) expose an onboard 1G NIC that adds a second
+        // host interface; when the host uses a managed DPU as its data path it
+        // must be disabled (it otherwise conflicts with the DPU NIC and bypasses
+        // VPC-based tenant isolation). Zero-DPU hosts that rely on the onboard
+        // NIC pass `false`. The caller owns this decision.
+        disable_onboard_nic: bool,
     ) -> RedfishFuture<'a, Result<Option<String>, RedfishError>> {
         <standard::RedfishStandard as Redfish>::machine_setup(
             self.std_redfish(),
@@ -360,26 +367,42 @@ pub trait Redfish: Send + Sync + 'static {
             bios_profiles,
             selected_profile,
             oem_manager_profiles,
+            disable_onboard_nic,
         )
     }
 
     /// Is everything that machine_setup does already done?
+    ///
+    /// `disable_onboard_nic` must match the value the caller passes to
+    /// `machine_setup`; it gates the onboard-NIC drift check so detection and
+    /// remediation agree (see `machine_setup`).
     fn machine_setup_status<'a>(
         &'a self,
         boot_interface: Option<BootInterfaceRef<'a>>,
+        disable_onboard_nic: bool,
     ) -> RedfishFuture<'a, Result<MachineSetupStatus, RedfishError>> {
         <standard::RedfishStandard as Redfish>::machine_setup_status(
             self.std_redfish(),
             boot_interface,
+            disable_onboard_nic,
         )
     }
 
     /// Check if only the BIOS/BMC setup is done
+    ///
+    /// `disable_onboard_nic` must match the value the caller passes to
+    /// `machine_setup`; it gates the onboard-NIC drift check so detection and
+    /// remediation agree (see `machine_setup`).
     fn is_bios_setup<'a>(
         &'a self,
         boot_interface: Option<BootInterfaceRef<'a>>,
+        disable_onboard_nic: bool,
     ) -> RedfishFuture<'a, Result<bool, RedfishError>> {
-        <standard::RedfishStandard as Redfish>::is_bios_setup(self.std_redfish(), boot_interface)
+        <standard::RedfishStandard as Redfish>::is_bios_setup(
+            self.std_redfish(),
+            boot_interface,
+            disable_onboard_nic,
+        )
     }
 
     /// Apply a standard BMC password policy. This varies a lot by vendor,

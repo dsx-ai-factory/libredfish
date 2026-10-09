@@ -31,6 +31,8 @@ use std::{collections::HashMap, path::Path, time::Duration};
 use tokio::fs::File;
 
 use crate::model::component_integrity::RegexToFirmwareIdOptions;
+use crate::model::oem::nvidia_openbmc::ChassisExtensions as NvidiaChassisOem;
+use crate::model::oem::ChassisExtensions as ChassisOem;
 use crate::model::sensor::{GPUSensors, Sensor, Sensors};
 use crate::model::service_root::RedfishVendor;
 use crate::model::storage::DriveCollection;
@@ -135,6 +137,9 @@ fn op_rom_device_is_dpu(token: &str) -> bool {
         .iter()
         .any(|id| strip_hex_prefix(id) == device)
 }
+
+/// Host BMC chassis that exposes OEM onboard nic management toggle on VR72.
+const HOST_MANAGEMENT_CHASSIS_ID: &str = "SMM_0";
 
 impl BootOptionMatchField {
     #[allow(dead_code)]
@@ -473,6 +478,7 @@ impl Redfish for Bmc {
             RedfishVendor,
             HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
         >,
+        disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
         Box::pin(async move {
             self.disable_secure_boot().await?;
@@ -482,17 +488,25 @@ impl Redfish for Bmc {
             attrs.extend(bios_attrs);
             let body = HashMap::from([("Attributes", attrs)]);
             let url = format!("Systems/{}/Bios/Settings", self.s.system_id());
-            self.s
-                .client
-                .patch(&url, body)
-                .await
-                .map(|_status_code| None)
+            self.s.client.patch(&url, body).await?;
+
+            // Disable onboard NICs on VR when the caller requests it and the
+            // host BMC exposes the toggle and it is still enabled; it otherwise
+            // adds a second host interface that conflicts with the BF4 DPU NIC
+            // and bypasses VPC tenant isolation. Hosts that keep the onboard NIC
+            // (e.g. zero-DPU) pass `false`.
+            if disable_onboard_nic && self.host_management_network_access().await? == Some(true) {
+                self.set_host_management_network_access(false).await?;
+            }
+
+            Ok(None)
         })
     }
 
     fn machine_setup_status<'a>(
         &'a self,
         boot_interface: Option<crate::BootInterfaceRef<'a>>,
+        disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<MachineSetupStatus, RedfishError>> {
         Box::pin(async move {
             // Resolve `InterfaceId` to a MAC via the Redfish-standard
@@ -504,7 +518,7 @@ impl Redfish for Bmc {
             let boot_interface_mac = resolved_mac.as_deref();
 
             // Check BIOS and BMC attributes
-            let mut diffs = self.diff_bios_bmc_attr().await?;
+            let mut diffs = self.diff_bios_bmc_attr(disable_onboard_nic).await?;
 
             // Check the first boot option
             if let Some(mac) = boot_interface_mac {
@@ -876,9 +890,10 @@ impl Redfish for Bmc {
     fn is_bios_setup<'a>(
         &'a self,
         _boot_interface: Option<crate::BootInterfaceRef<'a>>,
+        disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
         Box::pin(async move {
-            let diffs = self.diff_bios_bmc_attr().await?;
+            let diffs = self.diff_bios_bmc_attr(disable_onboard_nic).await?;
             Ok(diffs.is_empty())
         })
     }
@@ -1023,9 +1038,52 @@ impl Redfish for Bmc {
 }
 
 impl Bmc {
+    /// Read the current onboard-management-network toggle from the host BMC,
+    /// returning `None` when the platform does not expose it.
+    async fn host_management_network_access(&self) -> Result<Option<bool>, RedfishError> {
+        // `None` when the platform does not expose the toggle, so NICo neither
+        // flags drift nor patches it.
+        let url = format!("Chassis/{HOST_MANAGEMENT_CHASSIS_ID}");
+        let (_status_code, chassis): (StatusCode, Chassis) = self.s.client.get(&url).await?;
+        Ok(chassis
+            .oem
+            .and_then(|oem| oem.nvidia)
+            .and_then(|nvidia| nvidia.host_management_network_access))
+    }
+
+    /// Enable or disable the onboard Realtek RTL8153 USB 1G NIC via the host BMC.
+    ///
+    /// Reuses the chassis OEM read model so only the toggle is serialized
+    /// (`skip_serializing_if` keeps the rest of the resource out of the body).
+    async fn set_host_management_network_access(&self, enabled: bool) -> Result<(), RedfishError> {
+        let url = format!("Chassis/{HOST_MANAGEMENT_CHASSIS_ID}");
+        let oem = ChassisOem {
+            nvidia: Some(NvidiaChassisOem {
+                host_management_network_access: Some(enabled),
+                ..Default::default()
+            }),
+        };
+        self.s
+            .client
+            .patch(&url, serde_json::json!({ "Oem": oem }))
+            .await?;
+        Ok(())
+    }
+
     /// Check BIOS and BMC attributes and return differences
-    async fn diff_bios_bmc_attr(&self) -> Result<Vec<MachineSetupDiff>, RedfishError> {
+    async fn diff_bios_bmc_attr(
+        &self,
+        disable_onboard_nic: bool,
+    ) -> Result<Vec<MachineSetupDiff>, RedfishError> {
         let mut diffs = vec![];
+
+        if disable_onboard_nic && self.host_management_network_access().await? == Some(true) {
+            diffs.push(MachineSetupDiff {
+                key: "HostManagementNetworkAccess".to_string(),
+                expected: "false".to_string(),
+                actual: "true".to_string(),
+            });
+        }
 
         // Check BIOS and BMC attributes
         let sb = self.get_secure_boot().await?;
@@ -1324,6 +1382,74 @@ mod tests {
         assert!(!op_rom_device_is_dpu("0x15B31023"));
         // Same device id under a different vendor is not a DPU.
         assert!(!op_rom_device_is_dpu("0x8086A2DF"));
+    }
+
+    #[test]
+    fn host_management_oem_body_serializes_only_the_toggle() {
+        // The partial PATCH body built from the reused OEM read model must emit
+        // just the toggle, so it cannot clobber the rest of the chassis.
+        for enabled in [true, false] {
+            let oem = ChassisOem {
+                nvidia: Some(NvidiaChassisOem {
+                    host_management_network_access: Some(enabled),
+                    ..Default::default()
+                }),
+            };
+            assert_eq!(
+                serde_json::json!({ "Oem": oem }),
+                serde_json::json!({ "Oem": { "Nvidia": { "HostManagementNetworkAccess": enabled } } }),
+            );
+        }
+    }
+
+    fn chassis_host_management_network_access(chassis: &Chassis) -> Option<bool> {
+        chassis
+            .oem
+            .as_ref()
+            .and_then(|oem| oem.nvidia.as_ref())
+            .and_then(|nvidia| nvidia.host_management_network_access)
+    }
+
+    #[test]
+    fn chassis_host_management_network_access_reads_oem_flag() {
+        let enabled: Chassis = serde_json::from_value(serde_json::json!({
+            "Id": "SMM_0",
+            "Oem": { "Nvidia": {
+                "@odata.type": "#NvidiaChassis.v1_15_0.NvidiaChassis",
+                "HostManagementNetworkAccess": true
+            } }
+        }))
+        .expect("chassis deserializes");
+        assert_eq!(chassis_host_management_network_access(&enabled), Some(true));
+
+        let disabled: Chassis = serde_json::from_value(serde_json::json!({
+            "Id": "SMM_0",
+            "Oem": { "Nvidia": {
+                "@odata.type": "#NvidiaChassis.v1_15_0.NvidiaChassis",
+                "HostManagementNetworkAccess": false
+            } }
+        }))
+        .expect("chassis deserializes");
+        assert_eq!(
+            chassis_host_management_network_access(&disabled),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn chassis_host_management_network_access_absent_toggle_is_none() {
+        // Platforms that do not expose the toggle (missing field or OEM block)
+        // must be treated as unknown so NICo neither flags drift nor patches.
+        let toggle_absent: Chassis = serde_json::from_value(serde_json::json!({
+            "Id": "SMM_0",
+            "Oem": { "Nvidia": { "@odata.type": "#NvidiaChassis.v1_15_0.NvidiaChassis" } }
+        }))
+        .expect("chassis deserializes");
+        assert_eq!(chassis_host_management_network_access(&toggle_absent), None);
+
+        let oem_absent: Chassis = serde_json::from_value(serde_json::json!({ "Id": "SMM_0" }))
+            .expect("chassis deserializes");
+        assert_eq!(chassis_host_management_network_access(&oem_absent), None);
     }
 
     #[test]
