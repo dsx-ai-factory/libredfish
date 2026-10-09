@@ -490,10 +490,10 @@ impl Redfish for Bmc {
             let url = format!("Systems/{}/Bios/Settings", self.s.system_id());
             self.s.client.patch(&url, body).await?;
 
-            // Disable onboard NICs on VR when the caller requests it and the 
-            // host BMC exposes the toggle and it is still enabled; it otherwise 
-            // adds a second host interface that conflicts with the BF4 DPU NIC 
-            // and bypasses VPC tenant isolation. Hosts that keep the onboard NIC 
+            // Disable onboard NICs on VR when the caller requests it and the
+            // host BMC exposes the toggle and it is still enabled; it otherwise
+            // adds a second host interface that conflicts with the BF4 DPU NIC
+            // and bypasses VPC tenant isolation. Hosts that keep the onboard NIC
             // (e.g. zero-DPU) pass `false`.
             if disable_onboard_nic && self.host_management_network_access().await? == Some(true) {
                 self.set_host_management_network_access(false).await?;
