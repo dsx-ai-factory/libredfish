@@ -218,6 +218,7 @@ impl Redfish for Bmc {
             RedfishVendor,
             HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
         >,
+        _disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
         Box::pin(async move {
             self.setup_serial_console().await?;
@@ -241,6 +242,7 @@ impl Redfish for Bmc {
     fn machine_setup_status<'a>(
         &'a self,
         boot_interface: Option<crate::BootInterfaceRef<'a>>,
+        _disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<MachineSetupStatus, RedfishError>> {
         Box::pin(async move {
             // Resolve `InterfaceId` to a MAC via the Redfish-standard
@@ -716,6 +718,7 @@ impl Redfish for Bmc {
     fn is_bios_setup<'a>(
         &'a self,
         _boot_interface: Option<crate::BootInterfaceRef<'a>>,
+        _disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
         Box::pin(async move {
             let diffs = self.diff_bios_bmc_attr().await?;
