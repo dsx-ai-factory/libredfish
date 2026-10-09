@@ -694,6 +694,9 @@ class RfMockupServer(BaseHTTPRequestHandler):
 
         else:
             self.send_response(404)
+            # Empty 404 responses need explicit framing on the persistent TLS
+            # connection, or reqwest sees UnexpectedEof instead of HTTP 404.
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
     def do_PATCH(self):
@@ -810,6 +813,17 @@ class RfMockupServer(BaseHTTPRequestHandler):
 
         if data_received is not None:
             logger.info("   POST: Data: {}".format(data_received))
+            # Canned POST responses for legacy 405 and a non-405 Dell error.
+            for response_file in ("post_response.json", "post_response_server_error.json"):
+                post_response_fpath = self.construct_path(self.path, response_file)
+                if os.path.isfile(post_response_fpath):
+                    with open(post_response_fpath) as f:
+                        canned = json.load(f)
+                    match = canned.get("match_request_body_contains")
+                    if match is None or match in json.dumps(data_received):
+                        self.send_response_file(post_response_fpath)
+                        return
+
             # construct path "mockdir/path/to/resource/<filename>"
             fpath = self.construct_path(self.path, "index.json")
             success, payload = self.get_cached_link(fpath)
