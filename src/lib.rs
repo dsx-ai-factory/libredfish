@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 mod ami;
 mod dell;
 mod error;
+mod giga_computing_ami;
 mod hpe;
 pub mod jsonmap;
 mod lenovo;
