@@ -244,7 +244,8 @@ pub struct SetBmcLockdown {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct MachineBiosAttrs {
-    pub boot_seq_retry: EnabledDisabled,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_seq_retry: Option<EnabledDisabled>,
     pub in_band_manageability_interface: EnabledDisabled,
     pub uefi_variable_access: UefiVariableAccessSettings,
     pub serial_comm: SerialCommSettings,
@@ -1366,5 +1367,21 @@ mod test {
             serde_json::to_value(attrs).unwrap()["BootSeqRetry"],
             "Enabled"
         );
+    }
+
+    #[test]
+    fn machine_bios_attrs_omits_unsupported_boot_sequence_retry() {
+        let mut bios: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/bios_dell.json")).unwrap();
+        bios["Attributes"]
+            .as_object_mut()
+            .unwrap()
+            .remove("BootSeqRetry");
+        let attrs: MachineBiosAttrs = serde_json::from_value(bios["Attributes"].clone()).unwrap();
+
+        assert!(serde_json::to_value(attrs)
+            .unwrap()
+            .get("BootSeqRetry")
+            .is_none());
     }
 }

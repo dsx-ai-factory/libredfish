@@ -1071,11 +1071,9 @@ impl Bmc {
             };
         }
 
-        diff!(
-            "BootSeqRetry",
-            expected_attrs.boot_seq_retry,
-            EnabledDisabled
-        );
+        if let Some(exp) = expected_attrs.boot_seq_retry {
+            diff!("BootSeqRetry", exp, EnabledDisabled);
+        }
         diff!(
             "InBandManageabilityInterface",
             expected_attrs.in_band_manageability_interface,
@@ -1773,6 +1771,11 @@ impl Bmc {
     ) -> Result<dell::MachineBiosAttrs, RedfishError> {
         let curr_bios_attributes = self.s.bios_attributes().await?;
 
+        let boot_seq_retry = curr_bios_attributes
+            .get("BootSeqRetry")
+            .is_some()
+            .then_some(EnabledDisabled::Enabled);
+
         // RedirAfterBoot: Not available in iDRAC 10
         let redir_after_boot = curr_bios_attributes
             .get("RedirAfterBoot")
@@ -1810,7 +1813,7 @@ impl Bmc {
         };
 
         Ok(dell::MachineBiosAttrs {
-            boot_seq_retry: EnabledDisabled::Enabled,
+            boot_seq_retry,
             in_band_manageability_interface: EnabledDisabled::Disabled,
             uefi_variable_access: dell::UefiVariableAccessSettings::Standard,
             serial_comm,
