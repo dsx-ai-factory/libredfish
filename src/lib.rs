@@ -1063,7 +1063,8 @@ pub trait Redfish: Send + Sync + 'static {
         )
     }
 
-    // Gets MAC address for a single CX_NIC_{nic_index}_Port_0 EthernetInterface
+    // Gets the MAC address for the Vera-Rubin EthernetInterface associated with
+    // `nic_index`.
     // Only applicable to Vera-Rubin. `nic_index` must be in 0..8.
     fn get_spx_nic_mac_address<'a>(
         &'a self,
