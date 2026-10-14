@@ -144,7 +144,6 @@ impl Redfish for Bmc {
             RedfishVendor,
             HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
         >,
-        _disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
         Box::pin(async move {
             info!("Sushy: skipping machine_setup (emulator)");
@@ -155,7 +154,6 @@ impl Redfish for Bmc {
     fn machine_setup_status<'a>(
         &'a self,
         _boot_interface: Option<crate::BootInterfaceRef<'a>>,
-        _disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<MachineSetupStatus, RedfishError>> {
         Box::pin(async move {
             Ok(MachineSetupStatus {
@@ -309,7 +307,6 @@ impl Redfish for Bmc {
     fn is_bios_setup<'a>(
         &'a self,
         _boot_interface: Option<crate::BootInterfaceRef<'a>>,
-        _disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
         Box::pin(async move { Ok(true) })
     }
