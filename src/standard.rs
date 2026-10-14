@@ -357,7 +357,6 @@ impl Redfish for RedfishStandard {
             RedfishVendor,
             HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
         >,
-        _disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
         Box::pin(async move { Err(RedfishError::NotSupported("machine_setup".to_string())) })
     }
@@ -365,7 +364,6 @@ impl Redfish for RedfishStandard {
     fn machine_setup_status<'a>(
         &'a self,
         _boot_interface: Option<crate::BootInterfaceRef<'a>>,
-        _disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<MachineSetupStatus, RedfishError>> {
         Box::pin(async move {
             Err(RedfishError::NotSupported(
@@ -1233,7 +1231,6 @@ impl Redfish for RedfishStandard {
     fn is_bios_setup<'a>(
         &'a self,
         _boot_interface: Option<crate::BootInterfaceRef<'a>>,
-        _disable_onboard_nic: bool,
     ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
         Box::pin(async move { Err(RedfishError::NotSupported("is_bios_setup".to_string())) })
     }

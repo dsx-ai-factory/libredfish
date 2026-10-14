@@ -426,13 +426,7 @@ async fn run_integration_test(
     if vendor_dir == "supermicro" {
         let profiles = HashMap::new();
         redfish
-            .machine_setup(
-                None,
-                &profiles,
-                BiosProfileType::Performance,
-                &profiles,
-                false,
-            )
+            .machine_setup(None, &profiles, BiosProfileType::Performance, &profiles)
             .await?;
     }
 
@@ -526,10 +520,10 @@ async fn run_integration_test(
         let target = libredfish::BootInterfaceRef::Mac(mac_address::MacAddress::new([
             0x58, 0xA2, 0xE1, 0xBB, 0xB1, 0x0F,
         ]));
-        assert!(redfish.is_bios_setup(Some(target), false).await?);
+        assert!(redfish.is_bios_setup(Some(target)).await?);
         assert!(!redfish.is_boot_order_setup(target).await?);
         assert!(redfish
-            .machine_setup_status(Some(target), false)
+            .machine_setup_status(Some(target))
             .await?
             .diffs
             .iter()
