@@ -81,6 +81,11 @@ fn usable_standard_boot_order(boot_order: Vec<String>) -> Option<Vec<String>> {
     (!boot_order.is_empty()).then_some(boot_order)
 }
 
+fn should_fallback_to_fixed_boot_order(error: &RedfishError) -> bool {
+    matches!(error, RedfishError::HTTPErrorCode { status_code, .. }
+        if *status_code == StatusCode::BAD_REQUEST)
+}
+
 fn is_supported_uefi_http_boot_option(display_name: &str) -> bool {
     display_name.contains(MELLANOX_UEFI_HTTP_IPV4) || display_name.contains(NVIDIA_UEFI_HTTP_IPV4)
 }
@@ -617,17 +622,7 @@ impl Redfish for Bmc {
             {
                 Ok(true) => return Ok(None),
                 Ok(false) => {}
-                Err(RedfishError::HTTPErrorCode {
-                    status_code,
-                    response_body,
-                    ..
-                }) if status_code == reqwest::StatusCode::BAD_REQUEST
-                    && response_body.contains("PropertyUnknown")
-                    && response_body.contains("BootOrder") =>
-                {
-                    // Fall back to the following method if we get this error:
-                    // HTTP 400 - "The property BootOrder is not in the list of valid properties for the resource"
-                }
+                Err(error) if should_fallback_to_fixed_boot_order(&error) => {}
                 Err(e) => return Err(e),
             }
 
@@ -789,14 +784,7 @@ impl Bmc {
                     boot_interface_mac,
                 ))
             }
-            Err(RedfishError::HTTPErrorCode {
-                status_code,
-                response_body,
-                ..
-            }) if status_code == reqwest::StatusCode::BAD_REQUEST
-                && response_body.contains("PropertyUnknown")
-                && response_body.contains("BootOrder") =>
-            {
+            Err(error) if should_fallback_to_fixed_boot_order(&error) => {
                 // Fall back to FixedBootOrder for platforms that don't support standard BootOptions
                 self.load_fixed_boot_order_diff(boot_interface_mac).await
             }
@@ -1352,6 +1340,31 @@ mod tests {
             id: reference.to_string(),
             name: display_name.to_string(),
             uefi_device_path: None,
+        }
+    }
+
+    #[test]
+    fn fixed_boot_order_fallback_is_limited_to_bad_request() {
+        for (status_code, response_body, expected) in [
+            (StatusCode::BAD_REQUEST, "Bad Request", true),
+            (StatusCode::BAD_REQUEST, "", true),
+            (StatusCode::NOT_FOUND, "Not Found", false),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                false,
+            ),
+        ] {
+            let error = RedfishError::HTTPErrorCode {
+                url: "Systems/1".to_string(),
+                status_code,
+                response_body: response_body.to_string(),
+            };
+            assert_eq!(
+                should_fallback_to_fixed_boot_order(&error),
+                expected,
+                "unexpected fallback decision for {status_code}"
+            );
         }
     }
 
