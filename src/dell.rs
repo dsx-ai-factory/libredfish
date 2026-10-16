@@ -88,6 +88,13 @@ fn boot_option_name_matches(expected: &str, actual: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with(" - "))
 }
 
+fn boot_order_settings_payload(boot_option_id: &str) -> Value {
+    serde_json::json!({
+        "@Redfish.SettingsApplyTime": {"ApplyTime": "OnReset"},
+        "Boot": {"BootOrder": [boot_option_id]},
+    })
+}
+
 pub struct Bmc {
     s: RedfishStandard,
 }
@@ -807,10 +814,7 @@ impl Redfish for Bmc {
                     self.delete_job_queue().await?;
 
                     let url = format!("Systems/{}/Settings", self.s.system_id());
-                    let body = HashMap::from([(
-                        "Boot",
-                        HashMap::from([("BootOrder", vec![boot_option.id.clone()])]),
-                    )]);
+                    let body = boot_order_settings_payload(&boot_option.id);
 
                     return self.patch_settings_for_job_id(&url, body).await;
                 }
@@ -2338,7 +2342,9 @@ impl std::fmt::Display for XmlPcdata<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{boot_option_name_matches, nw_dev_func_matches, Bmc, XmlPcdata};
+    use super::{
+        boot_option_name_matches, boot_order_settings_payload, nw_dev_func_matches, Bmc, XmlPcdata,
+    };
     use crate::model::network_device_function::{Ethernet, NetworkDeviceFunction};
     use crate::{BootInterfaceRef, Endpoint, RedfishClientPool};
     use std::collections::HashMap;
@@ -2480,6 +2486,17 @@ mod tests {
                 "unexpected match result for {actual}"
             );
         }
+    }
+
+    #[test]
+    fn boot_order_settings_apply_on_reset() {
+        assert_eq!(
+            boot_order_settings_payload("Boot0000"),
+            serde_json::json!({
+                "@Redfish.SettingsApplyTime": {"ApplyTime": "OnReset"},
+                "Boot": {"BootOrder": ["Boot0000"]},
+            })
+        );
     }
 
     // Mirrors the attribute-merge logic in machine_setup_oem so we can test it
