@@ -1,0 +1,16 @@
+{
+    "@odata.id": "/redfish/v1",
+    "@odata.type": "#ServiceRoot.v1_15_0.ServiceRoot",
+    "Chassis": {
+        "@odata.id": "/redfish/v1/Chassis"
+    },
+    "Managers": {
+        "@odata.id": "/redfish/v1/Managers"
+    },
+    "Product": "BlueField-4 DPU",
+    "RedfishVersion": "1.17.0",
+    "Systems": {
+        "@odata.id": "/redfish/v1/Systems"
+    },
+    "Vendor": "Nvidia"
+}

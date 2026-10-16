@@ -21,6 +21,17 @@ pub struct ChassisExtensions {
     pub revision_id: Option<i32>,                        // GB200
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChassisOemActions {
+    #[serde(rename = "#NvidiaChassis.Reset")]
+    pub reset: Option<NvidiaChassisResetAction>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NvidiaChassisResetAction {
+    pub target: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
 pub enum BackgroundCopyStatus {
     InProgress,

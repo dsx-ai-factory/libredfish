@@ -1,0 +1,14 @@
+{
+    "@odata.id": "/redfish/v1/Chassis/BlueField_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+        "Oem": {
+            "#NvidiaChassis.Reset": {
+                "target": "/redfish/v1/Chassis/Stale/Actions/Oem/NvidiaChassis.Reset"
+            }
+        }
+    },
+    "ChassisType": "Card",
+    "Id": "BlueField_0",
+    "Name": "BlueField_0"
+}
