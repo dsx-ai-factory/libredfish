@@ -95,21 +95,6 @@ fn boot_order_settings_payload(boot_option_id: &str) -> Value {
     })
 }
 
-fn legacy_boot_order_settings_payload(boot_option_id: &str) -> Value {
-    serde_json::json!({"Boot": {"BootOrder": [boot_option_id]}})
-}
-
-fn rejects_settings_apply_time(error: &RedfishError) -> bool {
-    matches!(
-        error,
-        RedfishError::HTTPErrorCode {
-            status_code: StatusCode::BAD_REQUEST,
-            response_body,
-            ..
-        } if response_body.contains("SettingsApplyTime")
-    )
-}
-
 pub struct Bmc {
     s: RedfishStandard,
 }
@@ -831,23 +816,7 @@ impl Redfish for Bmc {
                     let url = format!("Systems/{}/Settings", self.s.system_id());
                     let body = boot_order_settings_payload(&boot_option.id);
 
-                    return match self.patch_settings_for_job_id(&url, body).await {
-                        Ok(job_id) => Ok(job_id),
-                        Err(error) if rejects_settings_apply_time(&error) => {
-                            tracing::warn!(
-                                bmc_ip = %self.s.client.host(),
-                                %url,
-                                %error,
-                                "Dell rejected SettingsApplyTime; retrying boot-order PATCH without it"
-                            );
-                            self.patch_settings_for_job_id(
-                                &url,
-                                legacy_boot_order_settings_payload(&boot_option.id),
-                            )
-                            .await
-                        }
-                        Err(error) => Err(error),
-                    };
+                    return self.patch_settings_for_job_id(&url, body).await;
                 }
             }
 
@@ -2374,12 +2343,10 @@ impl std::fmt::Display for XmlPcdata<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        boot_option_name_matches, boot_order_settings_payload, legacy_boot_order_settings_payload,
-        nw_dev_func_matches, rejects_settings_apply_time, Bmc, XmlPcdata,
+        boot_option_name_matches, boot_order_settings_payload, nw_dev_func_matches, Bmc, XmlPcdata,
     };
     use crate::model::network_device_function::{Ethernet, NetworkDeviceFunction};
-    use crate::{BootInterfaceRef, Endpoint, RedfishClientPool, RedfishError};
-    use reqwest::StatusCode;
+    use crate::{BootInterfaceRef, Endpoint, RedfishClientPool};
     use std::collections::HashMap;
 
     fn ndf_with(id: Option<&str>, mac: Option<&str>) -> NetworkDeviceFunction {
@@ -2530,43 +2497,6 @@ mod tests {
                 "Boot": {"BootOrder": ["Boot0000"]},
             })
         );
-    }
-
-    #[test]
-    fn legacy_boot_order_settings_omit_apply_time() {
-        assert_eq!(
-            legacy_boot_order_settings_payload("Boot0000"),
-            serde_json::json!({"Boot": {"BootOrder": ["Boot0000"]}})
-        );
-    }
-
-    #[test]
-    fn settings_apply_time_rejection_allows_legacy_retry() {
-        let error = RedfishError::HTTPErrorCode {
-            url: "Systems/System.Embedded.1/Settings".to_string(),
-            status_code: StatusCode::BAD_REQUEST,
-            response_body: r#"{"RelatedProperties":["@Redfish.SettingsApplyTime"]}"#.to_string(),
-        };
-
-        assert!(rejects_settings_apply_time(&error));
-    }
-
-    #[test]
-    fn unrelated_errors_do_not_allow_legacy_retry() {
-        for error in [
-            RedfishError::HTTPErrorCode {
-                url: "Systems/System.Embedded.1/Settings".to_string(),
-                status_code: StatusCode::BAD_REQUEST,
-                response_body: r#"{"RelatedProperties":["BootOrder"]}"#.to_string(),
-            },
-            RedfishError::HTTPErrorCode {
-                url: "Systems/System.Embedded.1/Settings".to_string(),
-                status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                response_body: "SettingsApplyTime".to_string(),
-            },
-        ] {
-            assert!(!rejects_settings_apply_time(&error));
-        }
     }
 
     // Mirrors the attribute-merge logic in machine_setup_oem so we can test it
