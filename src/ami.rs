@@ -69,9 +69,21 @@ fn find_boot_option_for_mac<'a>(
     boot_interface_mac: &str,
 ) -> Option<&'a BootOption> {
     let mac = boot_interface_mac.to_uppercase();
+    // Some adapters (e.g. Intel I210) omit the MAC from the boot option DisplayName but
+    // still embed it in the UefiDevicePath as `MAC(XXXXXXXXXXXX,0x1)` (no separators),
+    // whereas the DisplayName uses the colon form. Match either, normalizing separators.
+    let mac_no_sep = mac.replace([':', '-'], "");
     boot_options.iter().find(|option| {
         let display = option.display_name.to_uppercase();
-        display.contains("HTTP") && display.contains("IPV4") && display.contains(&mac)
+        if !(display.contains("HTTP") && display.contains("IPV4")) {
+            return false;
+        }
+        display.contains(&mac)
+            || option.uefi_device_path.as_ref().is_some_and(|path| {
+                path.to_uppercase()
+                    .replace([':', '-'], "")
+                    .contains(&mac_no_sep)
+            })
     })
 }
 
@@ -1226,6 +1238,59 @@ mod tests {
             name: display_name.to_string(),
             uefi_device_path: None,
         }
+    }
+
+    fn boot_option_with_device_path(
+        reference: &str,
+        display_name: &str,
+        uefi_device_path: &str,
+    ) -> BootOption {
+        BootOption {
+            uefi_device_path: Some(uefi_device_path.to_string()),
+            ..boot_option(reference, "UefiHttp", display_name, Some(true))
+        }
+    }
+
+    #[test]
+    fn find_boot_option_matches_mac_in_display_name() {
+        let options = boot_options(Some(true), Some(true), Some(true));
+        let found = find_boot_option_for_mac(&options, BOOT_INTERFACE_MAC)
+            .expect("HTTP IPv4 option with MAC in DisplayName must match");
+        assert_eq!(found.boot_option_reference, "Boot0001");
+    }
+
+    #[test]
+    fn find_boot_option_matches_mac_in_uefi_device_path() {
+        // Intel I210: DisplayName lacks the MAC, but UefiDevicePath embeds it (no separators).
+        let options = vec![boot_option_with_device_path(
+            "Boot0005",
+            "[Slot6]UEFI: HTTP IPv4 Intel(R) I210 Gigabit Network Connection",
+            "VenHw(...)/PciRoot(0x5)/MAC(C4EFBB1B08EE,0x1)/IPv4(0.0.0.0,0x0,DHCP,...)/Uri()",
+        )];
+        let found = find_boot_option_for_mac(&options, "C4:EF:BB:1B:08:EE")
+            .expect("HTTP IPv4 option with MAC in UefiDevicePath must match");
+        assert_eq!(found.boot_option_reference, "Boot0005");
+    }
+
+    #[test]
+    fn find_boot_option_rejects_mac_only_in_pxe_device_path() {
+        // Must still require an HTTP IPv4 option, not a PXE one, even if the MAC matches.
+        let options = vec![boot_option_with_device_path(
+            "Boot0002",
+            "UEFI PXEv4 Intel(R) I210 Gigabit Network Connection",
+            "VenHw(...)/MAC(C4EFBB1B08EE,0x1)/IPv4(...)",
+        )];
+        assert!(find_boot_option_for_mac(&options, "C4:EF:BB:1B:08:EE").is_none());
+    }
+
+    #[test]
+    fn find_boot_option_none_when_mac_absent() {
+        let options = vec![boot_option_with_device_path(
+            "Boot0005",
+            "[Slot6]UEFI: HTTP IPv4 Intel(R) I210 Gigabit Network Connection",
+            "VenHw(...)/MAC(AABBCCDDEEFF,0x1)/IPv4(...)/Uri()",
+        )];
+        assert!(find_boot_option_for_mac(&options, "C4:EF:BB:1B:08:EE").is_none());
     }
 
     fn boot_options(
