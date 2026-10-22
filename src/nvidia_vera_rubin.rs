@@ -979,7 +979,7 @@ impl Redfish for Bmc {
         // Given the nic index, we have to translate it into cage and MPO numbers.
         // Cage number is ((nic_index / 2) * 2) + 1
         // MPO number is (nic_index % 2) + 1
-        // Then the Redfish path for getting the MAC is a/redfish/v1/Systems/System_0/EthernetInterfaces/NIC_0_C<cage>_<mpo>/MACAddress
+        // Then the Redfish path for getting the MAC is /redfish/v1/Systems/System_0/EthernetInterfaces/NIC_0_C<cage>_<mpo>
         Box::pin(async move {
             if nic_index >= 8 {
                 return Err(RedfishError::GenericError {
@@ -989,7 +989,7 @@ impl Redfish for Bmc {
             let cage = ((nic_index / 2) * 2) + 1;
             let mpo = (nic_index % 2) + 1;
             let url = format!(
-                "Systems/{}/EthernetInterfaces/NIC_0_C{cage}_{mpo}/MACAddress",
+                "Systems/{}/EthernetInterfaces/NIC_0_C{cage}_{mpo}",
                 self.s.system_id()
             );
             let (_status_code, iface): (StatusCode, crate::EthernetInterface) =
