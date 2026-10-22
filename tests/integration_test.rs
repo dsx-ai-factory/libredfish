@@ -633,6 +633,30 @@ async fn run_integration_test(
             .to_string();
         assert!(error.contains("UefiDevicePath"), "{error}");
         assert!(error.contains("MAC(020000000001,0x1)"), "{error}");
+
+        let network_path = "PciRoot(0x16)/MAC(020000000001,0x1)/IPv4(0.0.0.0)";
+        for path in [
+            format!("{network_path}/Uri(https://test-user:DO_NOT_LOG@boot.example.test/boot.efi)"),
+            format!("{network_path}/Uri(https://boot.example.test/boot.efi?sig=DO_NOT_LOG)"),
+            format!("{network_path}/Uri(https://boot.example.test/DO_NOT_LOG"),
+            format!("{network_path}/Uri(https://boot.example.test/Uri(DO_NOT_LOG))"),
+            format!("{network_path}/uRI(https://boot.example.test/DO_NOT_LOG)"),
+            "Uri(https://boot.example.test/DO_NOT_LOG)".to_string(),
+        ] {
+            http.patch(format!("{system_url}/BootOptions/Boot0005"))
+                .json(&serde_json::json!({"UefiDevicePath": path}))
+                .send()
+                .await?
+                .error_for_status()?;
+            let error = redfish
+                .set_boot_order_dpu_first(missing)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("DO_NOT_LOG"), "boot URI payload leaked");
+            assert!(!error.contains("boot.example.test"), "boot URL host leaked");
+            assert!(error.contains("Uri(<redacted>)"));
+        }
     }
 
     // Exercise set_boot_override on vendors that support the bare (no URI)

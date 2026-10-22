@@ -167,6 +167,14 @@ fn matches_http_ipv4_boot_option(option: &BootOption, boot_interface_mac: &str) 
     option.display_name.starts_with(&name)
 }
 
+fn redact_boot_uri(path: &str) -> String {
+    // Drop the entire URI payload, including malformed or unterminated nodes.
+    match path.to_ascii_lowercase().find("uri(") {
+        Some(start) => format!("{}Uri(<redacted>)", &path[..start]),
+        None => path.to_string(),
+    }
+}
+
 // Supported component to firmware mapping.
 // GPU, Source: HGX_IRoT_GPU_X Target: HGX_FW_GPU_X
 fn get_component_integrity_id_to_firmware_inventory_id_options(
@@ -1099,7 +1107,9 @@ impl Bmc {
                 .map(|b| {
                     format!(
                         "{}: {}; UefiDevicePath: {:?}",
-                        b.id, b.display_name, b.uefi_device_path
+                        b.id,
+                        b.display_name,
+                        b.uefi_device_path.as_deref().map(redact_boot_uri)
                     )
                 })
                 .collect();
@@ -1248,6 +1258,46 @@ mod tests {
             "UefiDevicePath": path,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn boot_uri_redaction_preserves_device_nodes_and_omits_payloads() {
+        for (path, expected) in [
+            ("", ""),
+            (
+                "MAC(020000000001,0x1)/IPv4(0.0.0.0)",
+                "MAC(020000000001,0x1)/IPv4(0.0.0.0)",
+            ),
+            (
+                "MAC(020000000001,0x1)/IPv4(0.0.0.0)/Uri()",
+                "MAC(020000000001,0x1)/IPv4(0.0.0.0)/Uri(<redacted>)",
+            ),
+            (
+                concat!(
+                    "IPv4(0.0.0.0)/Uri(https://test-user:DO_NOT_LOG@",
+                    "boot.example.test/x?sig=DO_NOT_LOG)"
+                ),
+                "IPv4(0.0.0.0)/Uri(<redacted>)",
+            ),
+            (
+                "IPv4(0.0.0.0)/Uri(https://boot.example.test/Uri(DO_NOT_LOG))",
+                "IPv4(0.0.0.0)/Uri(<redacted>)",
+            ),
+            (
+                "IPv4(0.0.0.0)/uRI(https://boot.example.test/DO_NOT_LOG",
+                "IPv4(0.0.0.0)/Uri(<redacted>)",
+            ),
+            (
+                "Uri(https://boot.example.test/DO_NOT_LOG)",
+                "Uri(<redacted>)",
+            ),
+            (
+                "PciRoot(\u{e9})/Uri(DO_NOT_LOG)",
+                "PciRoot(\u{e9})/Uri(<redacted>)",
+            ),
+        ] {
+            assert_eq!(redact_boot_uri(path), expected);
+        }
     }
 
     #[test]
