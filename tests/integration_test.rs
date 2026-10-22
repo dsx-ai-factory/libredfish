@@ -531,6 +531,110 @@ async fn run_integration_test(
         redfish.set_boot_order_dpu_first(target).await?;
     }
 
+    if vendor_dir == "nvidia_gb200" {
+        // Exercise unchanged GB200 fixture paths before changing any options.
+        let legacy_target = libredfish::BootInterfaceRef::Mac(mac_address::MacAddress::new([
+            0xD0, 0xF4, 0x05, 0x43, 0x95, 0x04,
+        ]));
+        let target = libredfish::BootInterfaceRef::Mac(mac_address::MacAddress::new([
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ]));
+        let http = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()?;
+        let system_url = format!("https://127.0.0.1:{port}/redfish/v1/Systems/System_0");
+        let mut original_order = redfish.get_system().await?.boot.boot_order;
+        assert!(!redfish.is_boot_order_setup(legacy_target).await?);
+        redfish.set_boot_order_dpu_first(legacy_target).await?;
+        let pending: serde_json::Value = http
+            .get(format!("{system_url}/Settings"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(pending["Boot"]["BootOrder"][0], "Boot000D");
+        http.patch(&system_url)
+            .json(&serde_json::json!({"Boot": {"BootOrder": pending["Boot"]["BootOrder"]}}))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert!(redfish.is_boot_order_setup(legacy_target).await?);
+
+        // Boot0001 precedes Boot0005 in the collection and becomes first in
+        // BootOrder too, so a label-only setter or verifier picks the decoy.
+        original_order.retain(|reference| reference != "Boot0001");
+        original_order.insert(0, "Boot0001".to_string());
+        let new_name = concat!(
+            "(S22/B1/D0/F0) UEFI HTTP IPv4 Nvidia Network Adapter - ",
+            "02:00:00:00:00:01 - 020000000001"
+        );
+        // A present path must make matching independent of either label.
+        for name in ["UEFI HTTPv4 (MAC:020000000001)", new_name] {
+            http.patch(format!("{system_url}/BootOptions/Boot0005"))
+                .json(&serde_json::json!({
+                    "DisplayName": name,
+                    "UefiDevicePath": "PciRoot(0x16)/MAC(020000000001,0x1)/IPv4(0.0.0.0)/Uri()",
+                }))
+                .send()
+                .await?
+                .error_for_status()?;
+            // Display names are not identities: a different first device may
+            // have the same label as the intended HTTP option.
+            http.patch(format!("{system_url}/BootOptions/{}", original_order[0]))
+                .json(&serde_json::json!({"DisplayName": name}))
+                .send()
+                .await?
+                .error_for_status()?;
+            http.patch(&system_url)
+                .json(&serde_json::json!({"Boot": {"BootOrder": original_order}}))
+                .send()
+                .await?
+                .error_for_status()?;
+            assert!(!redfish.is_boot_order_setup(target).await?, "{name}");
+            let status = redfish.machine_setup_status(Some(target)).await?;
+            let diff = status
+                .diffs
+                .iter()
+                .find(|diff| diff.key == "boot_first")
+                .unwrap();
+            assert_eq!(diff.expected, format!("Boot0005 ({name})"));
+            assert_eq!(diff.actual, format!("Boot0001 ({name})"));
+            redfish.set_boot_order_dpu_first(target).await?;
+
+            let pending: serde_json::Value = http
+                .get(format!("{system_url}/Settings"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let mut expected = original_order.clone();
+            expected.retain(|reference| reference != "Boot0005");
+            expected.insert(0, "Boot0005".to_string());
+            assert_eq!(pending["Boot"]["BootOrder"], serde_json::json!(expected));
+
+            // The mock cannot reboot: explicitly apply the pending order.
+            http.patch(&system_url)
+                .json(&serde_json::json!({"Boot": {"BootOrder": expected}}))
+                .send()
+                .await?
+                .error_for_status()?;
+            assert!(redfish.is_boot_order_setup(target).await?, "{name}");
+        }
+
+        let missing = libredfish::BootInterfaceRef::Mac(mac_address::MacAddress::new([
+            0x02, 0x00, 0x00, 0x00, 0x00, 0xFF,
+        ]));
+        let error = redfish
+            .set_boot_order_dpu_first(missing)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("UefiDevicePath"), "{error}");
+        assert!(error.contains("MAC(020000000001,0x1)"), "{error}");
+    }
+
     // Exercise set_boot_override on vendors that support the bare (no URI)
     // override variant via the standard Redfish Boot block PATCH. The mockup
     // doesn't validate the PATCH body -- this just verifies the call path

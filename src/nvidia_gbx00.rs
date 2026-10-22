@@ -109,6 +109,7 @@ impl BootOptionName {
 enum BootOptionMatchField {
     DisplayName,
     UefiDevicePath,
+    HttpIpv4Mac,
 }
 
 impl BootOptionMatchField {
@@ -117,6 +118,7 @@ impl BootOptionMatchField {
         match self {
             BootOptionMatchField::DisplayName => "Display Name",
             BootOptionMatchField::UefiDevicePath => "Uefi Device Path",
+            BootOptionMatchField::HttpIpv4Mac => "HTTP IPv4 MAC",
         }
     }
 }
@@ -125,6 +127,44 @@ impl Display for BootOptionMatchField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&self, f)
     }
+}
+
+fn matches_http_ipv4_boot_option(option: &BootOption, boot_interface_mac: &str) -> bool {
+    let mac = boot_interface_mac.replace([':', '-'], "");
+    if mac.len() != 12 || !mac.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+
+    if let Some(path) = option
+        .uefi_device_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+    {
+        // HTTP boot has an IPv4 node followed by a URI node; PXE has no URI.
+        // Split before the URI so slashes in an explicit URL do not split nodes.
+        let Some((network_path, uri)) = path.split_once("/Uri(") else {
+            return false;
+        };
+        let ipv4 = network_path
+            .rsplit('/')
+            .next()
+            .is_some_and(|node| node.starts_with("IPv4(") && node.ends_with(')'));
+        let matching_mac = network_path.split('/').any(|node| {
+            node.strip_prefix("MAC(")
+                .and_then(|node| node.strip_suffix(')'))
+                .and_then(|node| node.split_once(','))
+                .is_some_and(|(address, _)| address.eq_ignore_ascii_case(&mac))
+        });
+        return ipv4 && uri.ends_with(')') && matching_mac;
+    }
+
+    // Older firmware may omit the device path; retain its exact name format.
+    let name = format!(
+        "{} (MAC:{})",
+        BootOptionName::Http.to_string(),
+        mac.to_uppercase()
+    );
+    option.display_name.starts_with(&name)
 }
 
 // Supported component to firmware mapping.
@@ -504,11 +544,20 @@ impl Redfish for Bmc {
             if let Some(mac) = boot_interface_mac {
                 let (expected, actual) =
                     self.get_expected_and_actual_first_boot_option(mac).await?;
-                if expected.is_none() || expected != actual {
+                if expected.is_none()
+                    || expected.as_ref().map(|b| &b.boot_option_reference)
+                        != actual.as_ref().map(|b| &b.boot_option_reference)
+                {
+                    let describe = |option: Option<BootOption>| {
+                        option.map_or_else(
+                            || "Not found".to_string(),
+                            |b| format!("{} ({})", b.boot_option_reference, b.display_name),
+                        )
+                    };
                     diffs.push(MachineSetupDiff {
                         key: "boot_first".to_string(),
-                        expected: expected.unwrap_or_else(|| "Not found".to_string()),
-                        actual: actual.unwrap_or_else(|| "Not found".to_string()),
+                        expected: describe(expected),
+                        actual: describe(actual),
                     });
                 }
             }
@@ -822,14 +871,11 @@ impl Redfish for Bmc {
     ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
         Box::pin(async move {
             let address = crate::resolve_boot_interface_mac(self, boot_interface).await?;
-            let mac_address = address.replace(':', "").to_uppercase();
-            let boot_option_name =
-                format!("{} (MAC:{})", BootOptionName::Http.to_string(), mac_address);
             let boot_array = self
                 .get_boot_options_ids_with_first(
                     BootOptionName::Http,
-                    BootOptionMatchField::DisplayName,
-                    Some(&boot_option_name),
+                    BootOptionMatchField::HttpIpv4Mac,
+                    Some(&address),
                 )
                 .await?;
             self.change_boot_order(boot_array).await?;
@@ -879,7 +925,9 @@ impl Redfish for Bmc {
         Box::pin(async move {
             let mac = crate::resolve_boot_interface_mac(self, boot_interface).await?;
             let (expected, actual) = self.get_expected_and_actual_first_boot_option(&mac).await?;
-            Ok(expected.is_some() && expected == actual)
+            Ok(expected.is_some()
+                && expected.as_ref().map(|b| &b.boot_option_reference)
+                    == actual.as_ref().map(|b| &b.boot_option_reference))
         })
     }
 
@@ -978,16 +1026,12 @@ impl Bmc {
     async fn get_expected_and_actual_first_boot_option(
         &self,
         boot_interface_mac: &str,
-    ) -> Result<(Option<String>, Option<String>), RedfishError> {
-        let mac_address = boot_interface_mac.replace(':', "").to_uppercase();
-        let boot_option_name =
-            format!("{} (MAC:{})", BootOptionName::Http.to_string(), mac_address);
-
+    ) -> Result<(Option<BootOption>, Option<BootOption>), RedfishError> {
         let boot_options = self.s.get_system().await?.boot.boot_order;
 
         // Get actual first boot option
         let actual_first_boot_option = if let Some(first) = boot_options.first() {
-            Some(self.s.get_boot_option(first.as_str()).await?.display_name)
+            Some(self.s.get_boot_option(first.as_str()).await?)
         } else {
             None
         };
@@ -996,8 +1040,8 @@ impl Bmc {
         let mut expected_first_boot_option = None;
         for member in &boot_options {
             let b = self.s.get_boot_option(member.as_str()).await?;
-            if b.display_name.starts_with(&boot_option_name) {
-                expected_first_boot_option = Some(b.display_name);
+            if matches_http_ipv4_boot_option(&b, boot_interface_mac) {
+                expected_first_boot_option = Some(b);
                 break;
             }
         }
@@ -1046,12 +1090,18 @@ impl Bmc {
             BootOptionMatchField::UefiDevicePath => {
                 matches!(&b.uefi_device_path, Some(x) if x.starts_with(name_str))
             }
+            BootOptionMatchField::HttpIpv4Mac => matches_http_ipv4_boot_option(b, name_str),
         });
 
         let Some(target) = found_boot_option else {
             let all_names: Vec<_> = all_boot_options
                 .iter()
-                .map(|b| format!("{}: {}", b.id, b.display_name))
+                .map(|b| {
+                    format!(
+                        "{}: {}; UefiDevicePath: {:?}",
+                        b.id, b.display_name, b.uefi_device_path
+                    )
+                })
                 .collect();
             return Err(RedfishError::GenericError {
                 error: format!(
@@ -1177,6 +1227,165 @@ impl UpdateParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BOOT_MAC: &str = "02:00:00:00:00:01";
+    const LEGACY_HTTP_NAME: &str = "UEFI HTTPv4 (MAC:020000000001)";
+    const NEW_HTTP_NAME: &str =
+        "(S22/B1/D0/F0) UEFI HTTP IPv4 Nvidia Network Adapter - 02:00:00:00:00:01 - 020000000001";
+    const HTTP_PATH: &str = concat!(
+        "VenHw(1E5A432C-0466-4D31-B009-D4D9239271D3)/",
+        "PciRoot(0x16)/Pci(0x0,0x0)/MAC(020000000001,0x1)/IPv4(0.0.0.0)/Uri()"
+    );
+
+    fn boot_option(display_name: &str, path: Option<&str>) -> BootOption {
+        serde_json::from_value(serde_json::json!({
+            "@odata.id": "/redfish/v1/Systems/System_0/BootOptions/Boot0030",
+            "@odata.type": "#BootOption.v1_0_4.BootOption",
+            "Id": "Boot0030",
+            "Name": "Boot0030",
+            "BootOptionReference": "Boot0030",
+            "DisplayName": display_name,
+            "UefiDevicePath": path,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn http_ipv4_boot_matching_accepts_old_and_new_firmware() {
+        let cases = [
+            (
+                "explicit URL containing URI node text",
+                NEW_HTTP_NAME,
+                Some("MAC(020000000001,0x1)/IPv4(0.0.0.0)/Uri(http://h/Uri(x))"),
+                BOOT_MAC,
+            ),
+            (
+                "explicit boot URL",
+                NEW_HTTP_NAME,
+                Some("MAC(020000000001,0x1)/IPv4(0.0.0.0)/Uri(http://boot.example.test/ipxe.efi)"),
+                BOOT_MAC,
+            ),
+            ("new firmware", NEW_HTTP_NAME, Some(HTTP_PATH), BOOT_MAC),
+            ("old firmware", LEGACY_HTTP_NAME, Some(HTTP_PATH), BOOT_MAC),
+            (
+                "old firmware without path",
+                LEGACY_HTTP_NAME,
+                None,
+                BOOT_MAC,
+            ),
+            (
+                "old firmware with empty path",
+                LEGACY_HTTP_NAME,
+                Some(""),
+                BOOT_MAC,
+            ),
+            (
+                "compact MAC",
+                NEW_HTTP_NAME,
+                Some(HTTP_PATH),
+                "020000000001",
+            ),
+            (
+                "hyphenated MAC",
+                NEW_HTTP_NAME,
+                Some(HTTP_PATH),
+                "02-00-00-00-00-01",
+            ),
+            (
+                "independent of display name",
+                "Network",
+                Some(HTTP_PATH),
+                BOOT_MAC,
+            ),
+            (
+                "MAC case",
+                "Network",
+                Some("MAC(020000aabbcc,0x1)/IPv4(0.0.0.0)/Uri()"),
+                "02:00:00:AA:BB:CC",
+            ),
+        ];
+        for (case, name, path, mac) in cases {
+            assert!(
+                matches_http_ipv4_boot_option(&boot_option(name, path), mac),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_ipv4_boot_matching_rejects_other_devices_and_malformed_paths() {
+        let cases = [
+            (
+                "wrong NIC",
+                NEW_HTTP_NAME,
+                Some(HTTP_PATH),
+                "02:00:00:00:00:02",
+            ),
+            (
+                "PXE",
+                NEW_HTTP_NAME,
+                Some("MAC(020000000001,0x1)/IPv4(0.0.0.0)"),
+                BOOT_MAC,
+            ),
+            (
+                "IPv6",
+                NEW_HTTP_NAME,
+                Some("MAC(020000000001,0x1)/IPv6(::)/Uri()"),
+                BOOT_MAC,
+            ),
+            (
+                "disk",
+                LEGACY_HTTP_NAME,
+                Some("HD(1,GPT,ABC)/File(boot.efi)"),
+                BOOT_MAC,
+            ),
+            (
+                "missing MAC node",
+                NEW_HTTP_NAME,
+                Some("IPv4(0.0.0.0)/Uri()"),
+                BOOT_MAC,
+            ),
+            (
+                "partial MAC",
+                NEW_HTTP_NAME,
+                Some("MAC(02000000000100,0x1)/IPv4(0.0.0.0)/Uri()"),
+                BOOT_MAC,
+            ),
+            (
+                "malformed MAC node",
+                NEW_HTTP_NAME,
+                Some("MAC(020000000001,0x1/IPv4(0.0.0.0)/Uri()"),
+                BOOT_MAC,
+            ),
+            (
+                "malformed IPv4 node",
+                NEW_HTTP_NAME,
+                Some("MAC(020000000001,0x1)/IPv4(0.0.0.0/Uri()"),
+                BOOT_MAC,
+            ),
+            (
+                "malformed URI node",
+                NEW_HTTP_NAME,
+                Some("MAC(020000000001,0x1)/IPv4(0.0.0.0)/Uri("),
+                BOOT_MAC,
+            ),
+            (
+                "conflicting display MAC",
+                LEGACY_HTTP_NAME,
+                Some("MAC(020000000002,0x1)/IPv4(0.0.0.0)/Uri()"),
+                BOOT_MAC,
+            ),
+            ("new name without path", NEW_HTTP_NAME, None, BOOT_MAC),
+            ("empty MAC", LEGACY_HTTP_NAME, Some(HTTP_PATH), ""),
+            ("invalid MAC", NEW_HTTP_NAME, Some(HTTP_PATH), "not-a-mac"),
+        ];
+        for (case, name, path, mac) in cases {
+            assert!(
+                !matches_http_ipv4_boot_option(&boot_option(name, path), mac),
+                "{case}"
+            );
+        }
+    }
 
     #[test]
     fn gb300_machine_setup_uses_vendor_specific_bios_attributes() {
