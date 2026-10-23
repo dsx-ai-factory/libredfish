@@ -56,6 +56,84 @@ const MIN_BMC_FW_IPMI_HOST_IFACE: &str = "01.05.01";
 const HARD_DISK: &str = "UEFI Hard Disk";
 const NETWORK: &str = "UEFI Network";
 
+/// The request `power(ACPowercycle)` sends: the action path relative to the
+/// Redfish root, and its `ResetType`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcPowerCycleRequest {
+    path: String,
+    reset_type: &'static str,
+}
+
+/// Picks the AC power cycle request a system advertises: the OEM `ACCycle`
+/// reset if present, otherwise the standard `FullPowerCycle` reset type when
+/// it is allowed inline or in `reset_action_info` (the `ComputerSystem.Reset`
+/// ActionInfo). `None` when neither is advertised.
+fn select_ac_power_cycle_request(
+    system: &serde_json::Value,
+    reset_action_info: Option<&serde_json::Value>,
+) -> Option<AcPowerCycleRequest> {
+    if let Some(target) = system
+        .pointer("/Actions/Oem/#OemSystemExtensions.Reset/target")
+        .and_then(serde_json::Value::as_str)
+        .filter(|target| !target.is_empty())
+    {
+        return Some(AcPowerCycleRequest {
+            path: redfish_relative_path(target).to_string(),
+            reset_type: "ACCycle",
+        });
+    }
+    let reset = system.pointer("/Actions/#ComputerSystem.Reset")?;
+    let target = reset
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .filter(|target| !target.is_empty())?;
+    let allowed = allows_full_power_cycle(reset.get("ResetType@Redfish.AllowableValues"))
+        || reset_action_info
+            .is_some_and(|info| allows_full_power_cycle(action_info_reset_types(info)));
+    allowed.then(|| AcPowerCycleRequest {
+        path: redfish_relative_path(target).to_string(),
+        reset_type: "FullPowerCycle",
+    })
+}
+
+/// A Redfish URI as a path relative to the Redfish root, for `client.get`
+/// and `client.post`. Accepts absolute URLs, `//host/...` references and
+/// `/redfish/v1/...` paths.
+fn redfish_relative_path(uri: &str) -> &str {
+    let after_scheme = ["https://", "http://", "//"].iter().find_map(|scheme| {
+        uri.get(..scheme.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            .map(|_| &uri[scheme.len()..])
+    });
+    let path = match after_scheme {
+        Some(rest) => rest.find('/').map_or("", |slash| &rest[slash..]),
+        None => uri,
+    };
+    path.strip_prefix("/redfish/v1/").unwrap_or(path)
+}
+
+fn allows_full_power_cycle(allowable_values: Option<&serde_json::Value>) -> bool {
+    allowable_values
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str() == Some("FullPowerCycle"))
+        })
+}
+
+/// `AllowableValues` of the `ResetType` parameter in an ActionInfo resource.
+fn action_info_reset_types(action_info: &serde_json::Value) -> Option<&serde_json::Value> {
+    action_info
+        .get("Parameters")?
+        .as_array()?
+        .iter()
+        .find(|parameter| {
+            parameter.get("Name").and_then(serde_json::Value::as_str) == Some("ResetType")
+        })?
+        .get("AllowableValues")
+}
+
 fn bios_settings_path(bios: &HashMap<String, serde_json::Value>, fallback: String) -> String {
     bios.get("@Redfish.Settings")
         .and_then(|settings| settings.get("SettingsObject"))
@@ -188,18 +266,29 @@ impl Redfish for Bmc {
     ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
             if action == SystemPowerControl::ACPowercycle {
+                let Some(request) = self.ac_power_cycle_request().await? else {
+                    return Err(RedfishError::NotSupported(
+                        "AC power cycle: system advertises neither OemSystemExtensions.Reset \
+                         nor the FullPowerCycle reset type"
+                            .to_string(),
+                    ));
+                };
                 let args: HashMap<String, String> =
-                    HashMap::from([("ResetType".to_string(), "ACCycle".to_string())]);
-                let url = format!(
-                    "Systems/{}/Actions/Oem/OemSystemExtensions.Reset",
-                    self.s.system_id()
-                );
-                return self.s.client.post(&url, args).await.map(|_status_code| ());
+                    HashMap::from([("ResetType".to_string(), request.reset_type.to_string())]);
+                return self
+                    .s
+                    .client
+                    .post(&request.path, args)
+                    .await
+                    .map(|_status_code| ());
             }
             self.s.power(action).await
         })
     }
 
+    /// `power(ACPowercycle)` uses the OEM `ACCycle` reset when the system
+    /// advertises it, otherwise the standard `FullPowerCycle` reset type, and
+    /// returns `NotSupported` when the system advertises neither.
     fn ac_powercycle_supported_by_power(&self) -> bool {
         true
     }
@@ -720,6 +809,28 @@ impl Redfish for Bmc {
 }
 
 impl Bmc {
+    /// The AC power cycle request this system advertises, if any. Fetches the
+    /// reset ActionInfo only when the system resource does not settle it.
+    async fn ac_power_cycle_request(&self) -> Result<Option<AcPowerCycleRequest>, RedfishError> {
+        let url = format!("Systems/{}", self.s.system_id());
+        let (_, system) = self.s.client.get::<serde_json::Value>(&url).await?;
+        if let Some(request) = select_ac_power_cycle_request(&system, None) {
+            return Ok(Some(request));
+        }
+        let Some(info_uri) = system
+            .pointer("/Actions/#ComputerSystem.Reset/@Redfish.ActionInfo")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(None);
+        };
+        let (_, info) = self
+            .s
+            .client
+            .get::<serde_json::Value>(redfish_relative_path(info_uri))
+            .await?;
+        Ok(select_ac_power_cycle_request(&system, Some(&info)))
+    }
+
     /// Check BIOS and BMC attributes and return differences
     async fn diff_bios_bmc_attr(&self) -> Result<Vec<MachineSetupDiff>, RedfishError> {
         let mut diffs = vec![];
@@ -1686,6 +1797,128 @@ mod tests {
                 assert_eq!(set.get(key), Some(&value), "{case}: {key}");
             }
             assert!(!set.contains_key("Re_SizeBARSupport"), "{case}");
+        }
+    }
+
+    #[test]
+    fn ac_power_cycle_request_follows_advertised_reset() {
+        let oem =
+            json!({ "target": "/redfish/v1/Systems/1/Actions/Oem/OemSystemExtensions.Reset" });
+        let reset = |allowable: Option<serde_json::Value>| {
+            let mut reset = json!({
+                "target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+                "@Redfish.ActionInfo": "/redfish/v1/Systems/1/ResetActionInfo",
+            });
+            if let Some(allowable) = allowable {
+                reset["ResetType@Redfish.AllowableValues"] = allowable;
+            }
+            reset
+        };
+        let action_info = |allowable: serde_json::Value| json!({ "Parameters": [{ "Name": "ResetType", "AllowableValues": allowable }] });
+        let request = |path: &str, reset_type: &'static str| {
+            Some(AcPowerCycleRequest {
+                path: path.to_string(),
+                reset_type,
+            })
+        };
+        let oem_request = request("Systems/1/Actions/Oem/OemSystemExtensions.Reset", "ACCycle");
+        let full_power_cycle = request("Systems/1/Actions/ComputerSystem.Reset", "FullPowerCycle");
+        for (case, system, info, expected) in [
+            (
+                "ARS-221GL: OEM ACCycle advertised",
+                json!({ "Actions": { "Oem": { "#OemSystemExtensions.Reset": oem },
+                    "#ComputerSystem.Reset": reset(Some(json!(["On", "PowerCycle"]))) } }),
+                None,
+                oem_request.clone(),
+            ),
+            (
+                "OEM ACCycle takes precedence over FullPowerCycle",
+                json!({ "Actions": { "Oem": { "#OemSystemExtensions.Reset": oem },
+                    "#ComputerSystem.Reset": reset(Some(json!(["On", "FullPowerCycle"]))) } }),
+                None,
+                oem_request,
+            ),
+            (
+                "SYS-221GE: FullPowerCycle allowed inline",
+                json!({ "Actions": { "Oem": {},
+                    "#ComputerSystem.Reset": reset(Some(json!(["On", "PowerCycle", "FullPowerCycle"]))) } }),
+                None,
+                full_power_cycle.clone(),
+            ),
+            (
+                "FullPowerCycle allowed only in ActionInfo",
+                json!({ "Actions": { "Oem": {}, "#ComputerSystem.Reset": reset(None) } }),
+                Some(action_info(json!(["On", "FullPowerCycle"]))),
+                full_power_cycle,
+            ),
+            (
+                "neither advertised",
+                json!({ "Actions": { "Oem": {}, "#ComputerSystem.Reset": reset(None) } }),
+                Some(action_info(json!(["On", "PowerCycle"]))),
+                None,
+            ),
+            (
+                "OEM entry without a target is ignored",
+                json!({ "Actions": { "Oem": { "#OemSystemExtensions.Reset": null },
+                    "#ComputerSystem.Reset": reset(None) } }),
+                None,
+                None,
+            ),
+            (
+                "network-path target",
+                json!({ "Actions": { "Oem": {}, "#ComputerSystem.Reset": {
+                    "target": "//192.0.2.10/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+                    "ResetType@Redfish.AllowableValues": ["FullPowerCycle"] } } }),
+                None,
+                request("Systems/1/Actions/ComputerSystem.Reset", "FullPowerCycle"),
+            ),
+            (
+                "absolute target URL",
+                json!({ "Actions": { "Oem": {}, "#ComputerSystem.Reset": {
+                    "target": "https://192.0.2.10/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+                    "ResetType@Redfish.AllowableValues": ["FullPowerCycle"] } } }),
+                None,
+                request("Systems/1/Actions/ComputerSystem.Reset", "FullPowerCycle"),
+            ),
+            (
+                "scheme is matched case-insensitively",
+                json!({ "Actions": { "Oem": {}, "#ComputerSystem.Reset": {
+                    "target": "HTTPS://192.0.2.10/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+                    "ResetType@Redfish.AllowableValues": ["FullPowerCycle"] } } }),
+                None,
+                request("Systems/1/Actions/ComputerSystem.Reset", "FullPowerCycle"),
+            ),
+            (
+                "advertised target is used, not a hard-coded path",
+                json!({ "Actions": { "Oem": { "#OemSystemExtensions.Reset": {
+                    "target": "/redfish/v1/Systems/Self/Actions/Oem/SmcReset" } } } }),
+                None,
+                request("Systems/Self/Actions/Oem/SmcReset", "ACCycle"),
+            ),
+            (
+                "empty OEM target is ignored",
+                json!({ "Actions": { "Oem": { "#OemSystemExtensions.Reset": { "target": "" } },
+                    "#ComputerSystem.Reset": reset(Some(json!(["FullPowerCycle"]))) } }),
+                None,
+                request("Systems/1/Actions/ComputerSystem.Reset", "FullPowerCycle"),
+            ),
+            (
+                "'://' in a query value does not make the target absolute",
+                json!({ "Actions": { "Oem": {}, "#ComputerSystem.Reset": {
+                    "target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset?next=https://example.invalid/x",
+                    "ResetType@Redfish.AllowableValues": ["FullPowerCycle"] } } }),
+                None,
+                request(
+                    "Systems/1/Actions/ComputerSystem.Reset?next=https://example.invalid/x",
+                    "FullPowerCycle",
+                ),
+            ),
+        ] {
+            assert_eq!(
+                select_ac_power_cycle_request(&system, info.as_ref()),
+                expected,
+                "{case}"
+            );
         }
     }
 }
