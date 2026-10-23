@@ -97,9 +97,10 @@ fn select_ac_power_cycle_request(
 }
 
 /// A Redfish URI as a path relative to the Redfish root, for `client.get`
-/// and `client.post`. Accepts absolute URLs and `/redfish/v1/...` paths.
+/// and `client.post`. Accepts absolute URLs, `//host/...` references and
+/// `/redfish/v1/...` paths.
 fn redfish_relative_path(uri: &str) -> &str {
-    let after_scheme = ["https://", "http://"].iter().find_map(|scheme| {
+    let after_scheme = ["https://", "http://", "//"].iter().find_map(|scheme| {
         uri.get(..scheme.len())
             .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
             .map(|_| &uri[scheme.len()..])
@@ -1862,6 +1863,14 @@ mod tests {
                     "#ComputerSystem.Reset": reset(None) } }),
                 None,
                 None,
+            ),
+            (
+                "network-path target",
+                json!({ "Actions": { "Oem": {}, "#ComputerSystem.Reset": {
+                    "target": "//192.0.2.10/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+                    "ResetType@Redfish.AllowableValues": ["FullPowerCycle"] } } }),
+                None,
+                request("Systems/1/Actions/ComputerSystem.Reset", "FullPowerCycle"),
             ),
             (
                 "absolute target URL",
