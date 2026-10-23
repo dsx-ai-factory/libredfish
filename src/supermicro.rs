@@ -75,6 +75,7 @@ fn select_ac_power_cycle_request(
     if let Some(target) = system
         .pointer("/Actions/Oem/#OemSystemExtensions.Reset/target")
         .and_then(serde_json::Value::as_str)
+        .filter(|target| !target.is_empty())
     {
         return Some(AcPowerCycleRequest {
             path: redfish_relative_path(target).to_string(),
@@ -82,7 +83,10 @@ fn select_ac_power_cycle_request(
         });
     }
     let reset = system.pointer("/Actions/#ComputerSystem.Reset")?;
-    let target = reset.get("target").and_then(serde_json::Value::as_str)?;
+    let target = reset
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .filter(|target| !target.is_empty())?;
     let allowed = allows_full_power_cycle(reset.get("ResetType@Redfish.AllowableValues"))
         || reset_action_info
             .is_some_and(|info| allows_full_power_cycle(action_info_reset_types(info)));
@@ -95,8 +99,11 @@ fn select_ac_power_cycle_request(
 /// A Redfish URI as a path relative to the Redfish root, for `client.get`
 /// and `client.post`. Accepts absolute URLs and `/redfish/v1/...` paths.
 fn redfish_relative_path(uri: &str) -> &str {
-    let path = match uri.split_once("://") {
-        Some((_, rest)) => rest.find('/').map_or("", |slash| &rest[slash..]),
+    let path = match uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+    {
+        Some(rest) => rest.find('/').map_or("", |slash| &rest[slash..]),
         None => uri,
     };
     path.strip_prefix("/redfish/v1/").unwrap_or(path)
@@ -1861,6 +1868,31 @@ mod tests {
                     "ResetType@Redfish.AllowableValues": ["FullPowerCycle"] } } }),
                 None,
                 request("Systems/1/Actions/ComputerSystem.Reset", "FullPowerCycle"),
+            ),
+            (
+                "advertised target is used, not a hard-coded path",
+                json!({ "Actions": { "Oem": { "#OemSystemExtensions.Reset": {
+                    "target": "/redfish/v1/Systems/Self/Actions/Oem/SmcReset" } } } }),
+                None,
+                request("Systems/Self/Actions/Oem/SmcReset", "ACCycle"),
+            ),
+            (
+                "empty OEM target is ignored",
+                json!({ "Actions": { "Oem": { "#OemSystemExtensions.Reset": { "target": "" } },
+                    "#ComputerSystem.Reset": reset(Some(json!(["FullPowerCycle"]))) } }),
+                None,
+                request("Systems/1/Actions/ComputerSystem.Reset", "FullPowerCycle"),
+            ),
+            (
+                "'://' in a query value does not make the target absolute",
+                json!({ "Actions": { "Oem": {}, "#ComputerSystem.Reset": {
+                    "target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset?next=https://example.invalid/x",
+                    "ResetType@Redfish.AllowableValues": ["FullPowerCycle"] } } }),
+                None,
+                request(
+                    "Systems/1/Actions/ComputerSystem.Reset?next=https://example.invalid/x",
+                    "FullPowerCycle",
+                ),
             ),
         ] {
             assert_eq!(
