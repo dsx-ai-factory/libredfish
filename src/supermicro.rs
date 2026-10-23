@@ -818,7 +818,7 @@ impl Bmc {
             };
         }
         add_keys!("QuietBoot", false);
-        add_keys!("Re-tryBoot", "EFI Boot");
+        add_keys!("Re_tryBoot", "EFI Boot");
         add_keys!("CSMSupport", "Disabled");
         add_keys!("SecureBootEnable", false);
 
@@ -830,7 +830,7 @@ impl Bmc {
 
         // Attributes to enable CPU virtualization support for faster VMs
         // Not that some are "Enable" and some are "Enabled". Subtle.
-        add_keys!("IntelVTforDirectedI/O(VT-d)", EnableDisable::Enable);
+        add_keys!("IntelVTforDirectedI_O_VT_d", EnableDisable::Enable);
         let intel_virtualization_value = bios_keys
             .get("IntelVirtualizationTechnology")
             .into_iter()
@@ -1206,15 +1206,13 @@ impl Bmc {
     // BIOS attribute names by their canonical name.
     // e.g. QuietBoot -> [QuietBoot_002E]
     //      TXTSupport -> [TXTSupport_0062, TXTSupport_0072]
+    //      SR_IOVSupport -> [SR_IOVSupport] (BIOS without hex suffixes)
     fn bios_attributes_name_map(
         attrs_map: &serde_json::Map<String, serde_json::Value>,
     ) -> HashMap<String, Vec<String>> {
         let mut by_name: HashMap<String, Vec<String>> = HashMap::with_capacity(attrs_map.len());
         for k in attrs_map.keys() {
-            let clean_key = k
-                .rsplit_once('_')
-                .map_or(k.as_str(), |(name, _suffix)| name.trim_end_matches('_'))
-                .to_string();
+            let clean_key = bios_attribute_name(k).to_string();
             by_name
                 .entry(clean_key)
                 .and_modify(|e| e.push(k.clone()))
@@ -1262,6 +1260,23 @@ fn is_mgx_c2_processor_module(chassis: &Chassis) -> bool {
             || chassis.part_number.as_deref().is_some_and(|part_number| {
                 part_number.contains(MGX_C2_PROCESSOR_MODULE_PART_NUMBER_FRAGMENT)
             }))
+}
+
+/// Supermicro BIOS attribute name without its optional `_XXXX` hex suffix.
+/// Some BIOS versions suffix every name (`SR_IOVSupport_002B`), others none
+/// (`SR_IOVSupport`). A bare trailing underscore, as in
+/// `IntelVTforDirectedI_O_VT_d_` or `IntelVTforDirectedI_O_VT_d__1E32`, is
+/// trimmed too. Any other final `_segment` is part of the name.
+fn bios_attribute_name(key: &str) -> &str {
+    let name = match key.rsplit_once('_') {
+        Some((name, suffix))
+            if suffix.len() == 4 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            name
+        }
+        _ => key,
+    };
+    name.trim_end_matches('_')
 }
 
 // UpdateParameters is what is sent for a multipart firmware upload's metadata.
@@ -1595,6 +1610,82 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(is_mgx_c2_processor_module(&chassis), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn bios_attribute_name_strips_only_hex_suffix() {
+        for (key, expected) in [
+            // Suffixed names (e.g. ARS-221GL BIOS 2.0b).
+            ("SR_IOVSupport_002B", "SR_IOVSupport"),
+            ("Re_tryBoot_0032", "Re_tryBoot"),
+            (
+                "IntelVTforDirectedI_O_VT_d__1E32",
+                "IntelVTforDirectedI_O_VT_d",
+            ),
+            ("TXTSupport_01_0062", "TXTSupport_01"),
+            // Unsuffixed names (e.g. SYS-221GE BIOS 2.4.V1).
+            ("SR_IOVSupport", "SR_IOVSupport"),
+            ("Re_tryBoot", "Re_tryBoot"),
+            ("Re_SizeBARSupport", "Re_SizeBARSupport"),
+            ("IntelVTforDirectedI_O_VT_d_", "IntelVTforDirectedI_O_VT_d"),
+            ("QuietBoot", "QuietBoot"),
+            // A final segment that is not four hex digits is part of the name.
+            ("UEFIBootOption_1", "UEFIBootOption_1"),
+            ("SATAController_s_0", "SATAController_s_0"),
+            ("Name_WXYZ", "Name_WXYZ"),
+            // Boundaries.
+            ("SR_IOVSupport_002b", "SR_IOVSupport"),
+            ("", ""),
+        ] {
+            assert_eq!(bios_attribute_name(key), expected, "{key}");
+        }
+    }
+
+    #[test]
+    fn machine_setup_attrs_sets_suffixed_and_unsuffixed_names() {
+        for (case, attrs, expected) in [
+            (
+                "unsuffixed",
+                json!({
+                    "Re_tryBoot": "Disabled",
+                    "Re_SizeBARSupport": "Enabled",
+                    "IntelVTforDirectedI_O_VT_d_": "Disable",
+                    "SR_IOVSupport": "Disabled",
+                    "SecurityDeviceSupport": "Enable",
+                }),
+                vec![
+                    ("Re_tryBoot", json!("EFI Boot")),
+                    ("IntelVTforDirectedI_O_VT_d_", json!("Enable")),
+                    ("SR_IOVSupport", json!("Enabled")),
+                ],
+            ),
+            (
+                "suffixed with repeated names",
+                json!({
+                    "Re_tryBoot_0032": "Disabled",
+                    "IntelVTforDirectedI_O_VT_d__1E32": "Disable",
+                    "SR_IOVSupport_002B": "Disabled",
+                    "SR_IOVSupport_0057": "Disabled",
+                    "SecurityDeviceSupport_002D": "Disabled",
+                }),
+                vec![
+                    ("Re_tryBoot_0032", json!("EFI Boot")),
+                    ("IntelVTforDirectedI_O_VT_d__1E32", json!("Enable")),
+                    ("SR_IOVSupport_002B", json!("Enabled")),
+                    ("SR_IOVSupport_0057", json!("Enabled")),
+                ],
+            ),
+        ] {
+            let attrs = attrs.as_object().unwrap().clone();
+            let set: HashMap<String, serde_json::Value> = Bmc::machine_setup_attrs(&attrs)
+                .unwrap()
+                .into_iter()
+                .collect();
+            for (key, value) in expected {
+                assert_eq!(set.get(key), Some(&value), "{case}: {key}");
+            }
+            assert!(!set.contains_key("Re_SizeBARSupport"), "{case}");
         }
     }
 }
