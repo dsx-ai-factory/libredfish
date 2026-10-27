@@ -428,11 +428,13 @@ pub trait Redfish: Send + Sync + 'static {
         <standard::RedfishStandard as Redfish>::lockdown(self.std_redfish(), target)
     }
 
-    /// Whether full lockdown includes a host-boot-latched control. Callers must
-    /// complete a host reboot after applying full policy on these platforms,
-    /// even when lockdown_status already reports the requested configuration.
-    /// False is the default and does not describe other vendor reboot needs.
-    fn lockdown_requires_host_reboot<'a>(
+    /// Whether full lockdown supports controls whose changes take effect at
+    /// host boot. This is a capability query: it ignores configured values,
+    /// pending changes, and previous calls, and does not indicate that a reboot
+    /// is currently needed. Callers must track policy application and completed
+    /// reboots separately. The default is false; other vendor reboot needs are
+    /// outside this capability.
+    fn lockdown_has_boot_latched_controls<'a>(
         &'a self,
     ) -> RedfishFuture<'a, Result<bool, RedfishError>> {
         Box::pin(async { Ok(false) })
