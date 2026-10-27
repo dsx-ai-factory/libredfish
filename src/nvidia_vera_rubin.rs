@@ -490,6 +490,57 @@ impl Redfish for Bmc {
         })
     }
 
+    fn set_enable_onboard_nics<'a>(
+        &'a self,
+        enable_onboard_nics: EnabledDisabled,
+    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
+        Box::pin(async move {
+            let power_state = self.get_power_state().await?;
+            if power_state != crate::PowerState::On {
+                return Err(RedfishError::GenericError {
+                    error: format!(
+                        "set_enable_onboard_nics requires host power On, got {}",
+                        power_state
+                    ),
+                });
+            }
+
+            // Always write: the stored value can disagree with the actual NIC
+            // state after an AUX cycle. The caller owns toggle sequencing.
+            self.s
+                .client
+                .patch(
+                    "Chassis/SMM_0",
+                    serde_json::json!({
+                        "Oem": {"Nvidia": {"HostManagementNetworkAccess": enable_onboard_nics.is_enabled()}}
+                    }),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn are_onboard_nics_enabled<'a>(
+        &'a self,
+    ) -> crate::RedfishFuture<'a, Result<Option<EnabledDisabled>, RedfishError>> {
+        Box::pin(async move {
+            let url = "Chassis/SMM_0";
+            let (_, body): (_, HashMap<String, serde_json::Value>) = self.s.client.get(url).await?;
+            let oem = jsonmap::get_object(&body, "Oem", url)?;
+            let nvidia = jsonmap::get_object(oem, "Nvidia", url)?;
+            if !nvidia.contains_key("HostManagementNetworkAccess") {
+                return Ok(None);
+            }
+            Ok(Some(
+                if jsonmap::get_bool(nvidia, "HostManagementNetworkAccess", url)? {
+                    EnabledDisabled::Enabled
+                } else {
+                    EnabledDisabled::Disabled
+                },
+            ))
+        })
+    }
+
     fn machine_setup_status<'a>(
         &'a self,
         boot_interface: Option<crate::BootInterfaceRef<'a>>,
@@ -517,6 +568,15 @@ impl Redfish for Bmc {
                         actual: actual.unwrap_or_else(|| "Not found".to_string()),
                     });
                 }
+            }
+
+            let actual = self.are_onboard_nics_enabled().await?;
+            if actual != Some(EnabledDisabled::Disabled) {
+                diffs.push(MachineSetupDiff {
+                    key: "HostManagementNetworkAccess".to_string(),
+                    expected: EnabledDisabled::Disabled.to_string(),
+                    actual: actual.map_or_else(|| "None".to_string(), |actual| actual.to_string()),
+                });
             }
 
             // We don't lockdown on Vera Rubin, so we don't need to check for it

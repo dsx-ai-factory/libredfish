@@ -361,6 +361,19 @@ impl Redfish for RedfishStandard {
         Box::pin(async move { Err(RedfishError::NotSupported("machine_setup".to_string())) })
     }
 
+    fn set_enable_onboard_nics<'a>(
+        &'a self,
+        _enable_onboard_nics: EnabledDisabled,
+    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn are_onboard_nics_enabled<'a>(
+        &'a self,
+    ) -> crate::RedfishFuture<'a, Result<Option<EnabledDisabled>, RedfishError>> {
+        Box::pin(async move { Ok(None) })
+    }
+
     fn machine_setup_status<'a>(
         &'a self,
         _boot_interface: Option<crate::BootInterfaceRef<'a>>,

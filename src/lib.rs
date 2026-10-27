@@ -363,6 +363,35 @@ pub trait Redfish: Send + Sync + 'static {
         )
     }
 
+    /// Enable or disable the host's onboard NICs.
+    /// `EnabledDisabled::Enabled` enables the NICs; `EnabledDisabled::Disabled`
+    /// disables them.
+    ///
+    /// Supported on Vera Rubin through `HostManagementNetworkAccess`. Requires
+    /// host power to be `On`; other power states and read/write failures return
+    /// an error. The standard implementation is a no-op returning `Ok(())`.
+    fn set_enable_onboard_nics<'a>(
+        &'a self,
+        enable_onboard_nics: EnabledDisabled,
+    ) -> RedfishFuture<'a, Result<(), RedfishError>> {
+        <standard::RedfishStandard as Redfish>::set_enable_onboard_nics(
+            self.std_redfish(),
+            enable_onboard_nics,
+        )
+    }
+
+    /// Read whether the BMC's stored setting enables the host's onboard NICs.
+    ///
+    /// On Vera Rubin, reads `Oem.Nvidia.HostManagementNetworkAccess` from
+    /// `Chassis/SMM_0` and returns `Some(EnabledDisabled)`. Missing or malformed
+    /// properties and read failures return an error. The standard implementation
+    /// returns `Ok(None)` without making a request.
+    fn are_onboard_nics_enabled<'a>(
+        &'a self,
+    ) -> RedfishFuture<'a, Result<Option<EnabledDisabled>, RedfishError>> {
+        <standard::RedfishStandard as Redfish>::are_onboard_nics_enabled(self.std_redfish())
+    }
+
     /// Is everything that machine_setup does already done?
     fn machine_setup_status<'a>(
         &'a self,
@@ -1356,6 +1385,19 @@ mod tests {
     fn redfish_implementation_only_requires_standard_redfish() {
         fn assert_redfish<T: Redfish>() {}
         assert_redfish::<DefaultDelegatingRedfish>();
+    }
+
+    #[tokio::test]
+    async fn onboard_nics_operations_are_noops_by_default() {
+        let pool = RedfishClientPool::builder().build().unwrap();
+        let redfish = DefaultDelegatingRedfish {
+            standard: *pool.create_standard_client(Endpoint::default()).unwrap(),
+        };
+        redfish
+            .set_enable_onboard_nics(EnabledDisabled::Disabled)
+            .await
+            .unwrap();
+        assert_eq!(redfish.are_onboard_nics_enabled().await.unwrap(), None);
     }
 
     #[test]
