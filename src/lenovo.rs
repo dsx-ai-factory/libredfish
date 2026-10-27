@@ -333,9 +333,19 @@ impl Redfish for Bmc {
         &'a self,
         target: EnabledDisabled,
     ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { self.set_xcc_lockdown(target).await })
+        // Runtime EFI protection is latched at host boot. Temporary BMC
+        // operations must preserve it rather than stage an unapplied change.
+        Box::pin(async move { self.set_xcc_lockdown(target, false).await })
     }
 
+    fn lockdown_requires_host_reboot<'a>(
+        &'a self,
+    ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
+        Box::pin(async move { Ok(self.get_xcc_lockdown().await?.uefi_variables.is_some()) })
+    }
+
+    /// Reports configured policy. UEFIVariablesRO enforcement changes only
+    /// after a host reboot, which cannot be verified from this resource.
     fn lockdown_status<'a>(&'a self) -> crate::RedfishFuture<'a, Result<Status, RedfishError>> {
         Box::pin(async move {
             let kcs = self.get_kcs_lenovo().await?;
@@ -1023,13 +1033,14 @@ impl Bmc {
         .inspect_err(|err| {
             debug!(%err, "Failed locking front panel USB to host-only.");
         })?;
-        self.set_xcc_lockdown(EnabledDisabled::Enabled).await
+        self.set_xcc_lockdown(EnabledDisabled::Enabled, true).await
     }
 
     /// Unlock a Lenovo server, restoring defaults
     pub async fn disable_lockdown(&self) -> Result<(), RedfishError> {
         // Release the BIOS settings lock before restoring legacy settings.
-        self.set_xcc_lockdown(EnabledDisabled::Disabled).await?;
+        self.set_xcc_lockdown(EnabledDisabled::Disabled, true)
+            .await?;
         self.set_kcs_lenovo(true).await.inspect_err(|err| {
             debug!(%err, "Failed enabling 'IPMI over KCS Access'");
         })?;
@@ -1094,7 +1105,11 @@ impl Bmc {
         }
     }
 
-    async fn set_xcc_lockdown(&self, target: EnabledDisabled) -> Result<(), RedfishError> {
+    async fn set_xcc_lockdown(
+        &self,
+        target: EnabledDisabled,
+        include_runtime_variables: bool,
+    ) -> Result<(), RedfishError> {
         let controls = self.get_xcc_lockdown().await?;
         let locked = target == EnabledDisabled::Enabled;
         let security_url = format!("Managers/{}/Oem/Lenovo/Security", self.s.manager_id());
@@ -1108,7 +1123,12 @@ impl Bmc {
         let mut bios_controls = HashMap::new();
         for (name, current) in [
             ("SettingsLockdown", controls.settings),
-            ("UEFIVariablesRO", controls.uefi_variables),
+            (
+                "UEFIVariablesRO",
+                controls
+                    .uefi_variables
+                    .filter(|_| include_runtime_variables),
+            ),
         ] {
             if current.is_some_and(|current| current != locked) {
                 bios_controls.insert(name, locked);

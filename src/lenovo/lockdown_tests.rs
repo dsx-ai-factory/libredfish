@@ -172,10 +172,7 @@ async fn optional_controls_are_discovered_independently_and_writes_are_idempoten
         (
             json!({}),
             json!({"Oem":{"Lenovo":{"UEFIVariablesRO":false}}}),
-            vec![patch(
-                BIOS,
-                json!({"Oem":{"Lenovo":{"UEFIVariablesRO":true}}}),
-            )],
+            vec![],
         ),
         (
             json!({"FWLockdown":true}),
@@ -199,10 +196,7 @@ async fn unlock_firmware_before_bios_and_lock_firmware_last() {
             json!({"Oem":{"Lenovo":{"SettingsLockdown":!locked,"UEFIVariablesRO":!locked}}}),
         );
         let fw = patch(SECURITY, json!({"FWLockdown":locked}));
-        let bios = patch(
-            BIOS,
-            json!({"Oem":{"Lenovo":{"SettingsLockdown":locked,"UEFIVariablesRO":locked}}}),
-        );
+        let bios = patch(BIOS, json!({"Oem":{"Lenovo":{"SettingsLockdown":locked}}}));
         script.extend(if locked {
             vec![bios, fw]
         } else {
@@ -218,6 +212,36 @@ async fn unlock_firmware_before_bios_and_lock_firmware_last() {
         .unwrap();
         server.finish().await;
     }
+}
+
+#[tokio::test]
+async fn reboot_requirement_is_discovered_without_treating_readback_as_enforcement() {
+    for (bios, expected) in [
+        (json!({}), false),
+        (json!({"Oem":{"Lenovo":{"SettingsLockdown":true}}}), false),
+        (json!({"Oem":{"Lenovo":{"UEFIVariablesRO":false}}}), true),
+        (json!({"Oem":{"Lenovo":{"UEFIVariablesRO":true}}}), true),
+    ] {
+        let (bmc, server) = client(discovery(json!({}), bios)).await;
+        assert_eq!(bmc.lockdown_requires_host_reboot().await.unwrap(), expected);
+        server.finish().await;
+    }
+
+    let mut script = discovery(json!({}), json!({}));
+    script.extend(discovery(
+        json!({}),
+        json!({"Oem":{"Lenovo":{"UEFIVariablesRO":false}}}),
+    ));
+    let (bmc, server) = client(script).await;
+    assert!(!bmc.lockdown_requires_host_reboot().await.unwrap());
+    assert!(bmc.lockdown_requires_host_reboot().await.unwrap());
+    server.finish().await;
+
+    let mut failed = get(BIOS, json!({}));
+    failed.status = 500;
+    let (bmc, server) = client(vec![get(SECURITY, json!({})), failed]).await;
+    assert!(bmc.lockdown_requires_host_reboot().await.is_err());
+    server.finish().await;
 }
 
 #[tokio::test]

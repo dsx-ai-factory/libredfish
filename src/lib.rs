@@ -419,6 +419,8 @@ pub trait Redfish: Send + Sync + 'static {
     }
 
     /// Lock the BIOS and BMC ready for tenant use. Disabled reverses the changes.
+    /// This applies configuration; it does not reboot the host. Some controls,
+    /// including Lenovo UEFIVariablesRO, take effect only at the next host boot.
     fn lockdown<'a>(
         &'a self,
         target: EnabledDisabled,
@@ -426,7 +428,18 @@ pub trait Redfish: Send + Sync + 'static {
         <standard::RedfishStandard as Redfish>::lockdown(self.std_redfish(), target)
     }
 
-    /// Are the BIOS and BMC currently locked down?
+    /// Whether full lockdown includes a host-boot-latched control. Callers must
+    /// complete a host reboot after applying full policy on these platforms,
+    /// even when lockdown_status already reports the requested configuration.
+    /// False is the default and does not describe other vendor reboot needs.
+    fn lockdown_requires_host_reboot<'a>(
+        &'a self,
+    ) -> RedfishFuture<'a, Result<bool, RedfishError>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Read lockdown status. Depending on the platform, this reports configured
+    /// policy rather than effective protection until a required reboot completes.
     fn lockdown_status<'a>(&'a self) -> RedfishFuture<'a, Result<Status, RedfishError>> {
         <standard::RedfishStandard as Redfish>::lockdown_status(self.std_redfish())
     }
@@ -857,6 +870,8 @@ pub trait Redfish: Send + Sync + 'static {
         <standard::RedfishStandard as Redfish>::get_base_mac_address(self.std_redfish())
     }
 
+    /// Temporarily change BMC lockdown. Lenovo changes the supported firmware
+    /// and BIOS-settings locks while preserving host runtime EFI protection.
     fn lockdown_bmc<'a>(
         &'a self,
         target: EnabledDisabled,
