@@ -68,6 +68,7 @@ const NVIDIA_VERA_RUBIN_PORT: &str = "8745";
 const NVIDIA_GBSWITCH_PORT: &str = "8742";
 const LITEON_POWERSHELF_PORT: &str = "8743";
 const DELTA_POWERSHELF_PORT: &str = "8744";
+const LENOVO_SLOW_PENDING_PATCH_PORT: &str = "8748";
 
 static SETUP: Once = Once::new();
 
@@ -105,6 +106,32 @@ async fn test_hpe() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_lenovo() -> Result<(), anyhow::Error> {
     run_integration_test("lenovo", LENOVO_PORT).await
+}
+
+#[tokio::test]
+async fn test_lenovo_boot_first_skips_pending_order_that_already_matches() -> anyhow::Result<()> {
+    let _server = run_mockup_server_with_args("lenovo", LENOVO_SLOW_PENDING_PATCH_PORT, &["-T"])?;
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let redfish = pool
+        .create_client(libredfish::Endpoint {
+            host: "127.0.0.1".to_string(),
+            port: Some(LENOVO_SLOW_PENDING_PATCH_PORT.parse()?),
+            ..Default::default()
+        })
+        .await?;
+    redfish.boot_first(libredfish::Boot::Pxe).await?;
+    let err = redfish
+        .boot_first(libredfish::Boot::HardDisk)
+        .await
+        .expect_err("a changed boot order must still be sent");
+    assert!(
+        matches!(&err, libredfish::RedfishError::NetworkError { url, source }
+            if url.ends_with("/Systems/1/Pending") && source.is_timeout()),
+        "unexpected error: {err}"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -340,6 +367,14 @@ async fn nvidia_dpu_integration_test(redfish: &dyn Redfish) -> Result<(), anyhow
 }
 
 fn run_mockup_server(vendor_dir: &'static str, port: &'static str) -> anyhow::Result<MockupServer> {
+    run_mockup_server_with_args(vendor_dir, port, &[])
+}
+
+fn run_mockup_server_with_args(
+    vendor_dir: &'static str,
+    port: &'static str,
+    extra_args: &'static [&'static str],
+) -> anyhow::Result<MockupServer> {
     SETUP.call_once(move || {
         use tracing_subscriber::fmt::Layer;
         use tracing_subscriber::prelude::*;
@@ -380,6 +415,7 @@ fn run_mockup_server(vendor_dir: &'static str, port: &'static str) -> anyhow::Re
     let mut mockup_server = MockupServer {
         vendor_dir,
         port,
+        extra_args,
         python,
         process: None,
     };
@@ -1251,6 +1287,7 @@ fn install_python_requirements(pip: PathBuf) -> Result<(), anyhow::Error> {
 struct MockupServer {
     vendor_dir: &'static str,
     port: &'static str,
+    extra_args: &'static [&'static str],
     python: PathBuf,
 
     process: Option<Child>,
@@ -1282,6 +1319,7 @@ impl MockupServer {
                 .arg("cert.pem")
                 .arg("--key")
                 .arg("key.pem")
+                .args(self.extra_args)
                 .spawn()?,
         );
         sleep(Duration::from_secs(1)); // let it start
