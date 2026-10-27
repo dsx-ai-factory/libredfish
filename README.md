@@ -92,7 +92,7 @@ export REDFISH_USER=inventory-reader
 read -r -s REDFISH_PASSWORD
 export REDFISH_PASSWORD
 # Set this only when the BMC needs an additional trusted CA bundle:
-export REDFISH_CA_CERT=/path/to/bmc-ca.pem
+# export REDFISH_CA_CERT=/path/to/bmc-ca.pem
 cargo run --example service_root
 ```
 
