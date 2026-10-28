@@ -570,8 +570,19 @@ impl Redfish for RedfishStandard {
         id: &'a str,
     ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
         Box::pin(async move {
+            if id.is_empty()
+                || matches!(id, "." | "..")
+                || id.contains(['/', '\\'])
+                || id.chars().any(char::is_control)
+            {
+                return Err(RedfishError::InvalidValue {
+                    url: "TaskService/Tasks".to_string(),
+                    field: "id".to_string(),
+                    err: InvalidValueError("Expected a single task identifier".to_string()),
+                });
+            }
             // Cancel this task, rather than touching the component's shared evidence endpoint.
-            let url = format!("TaskService/Tasks/{id}");
+            let url = format!("TaskService/Tasks/{}", urlencoding::encode(id));
             match self.client.delete(&url).await {
                 Ok(status) => Ok(status != StatusCode::ACCEPTED),
                 Err(RedfishError::HTTPErrorCode {

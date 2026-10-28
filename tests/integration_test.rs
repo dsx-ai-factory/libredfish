@@ -158,6 +158,7 @@ async fn test_task_cancellation() -> anyhow::Result<()> {
     for (task_id, expected) in [
         ("completed", Ok(true)),
         ("pending", Ok(false)),
+        ("task ?#%2e%2e-é", Ok(false)),
         ("missing", Ok(true)),
         ("unsupported", Err("unsupported")),
         ("failed", Err("http_503")),
@@ -175,6 +176,28 @@ async fn test_task_cancellation() -> anyhow::Result<()> {
                 error => panic!("unexpected cancellation failure for {task_id}: {error}"),
             });
         assert_eq!(result, expected, "task {task_id}");
+    }
+    for task_id in [
+        "",
+        ".",
+        "..",
+        "../Managers/1",
+        "../../ComponentIntegrity/1",
+        "/redfish/v1/TaskService/Tasks/completed",
+        "completed/child",
+        "completed/",
+        r"..\Managers\1",
+        "\t..",
+        "completed\n",
+        "completed\0",
+    ] {
+        assert!(
+            matches!(
+                client.cancel_task(task_id).await,
+                Err(libredfish::RedfishError::InvalidValue { .. })
+            ),
+            "expected invalid task identifier: {task_id:?}"
+        );
     }
     Ok(())
 }
