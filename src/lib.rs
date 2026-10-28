@@ -126,6 +126,17 @@ pub trait Redfish: Send + Sync + 'static {
         )
     }
 
+    /// Restore account-level IPMI access after changing the factory password.
+    /// The client must authenticate with `password`, the account's current password.
+    /// Vendors without this requirement do nothing.
+    fn enable_ipmi_account_access<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _password: &'a str,
+    ) -> RedfishFuture<'a, Result<(), RedfishError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// List current user accounts
     fn get_accounts<'a>(&'a self) -> RedfishFuture<'a, Result<Vec<ManagerAccount>, RedfishError>> {
         <standard::RedfishStandard as Redfish>::get_accounts(self.std_redfish())
@@ -419,6 +430,8 @@ pub trait Redfish: Send + Sync + 'static {
     }
 
     /// Lock the BIOS and BMC ready for tenant use. Disabled reverses the changes.
+    /// This applies configuration; it does not reboot the host. Some controls,
+    /// including Lenovo UEFIVariablesRO, take effect only at the next host boot.
     fn lockdown<'a>(
         &'a self,
         target: EnabledDisabled,
@@ -426,7 +439,20 @@ pub trait Redfish: Send + Sync + 'static {
         <standard::RedfishStandard as Redfish>::lockdown(self.std_redfish(), target)
     }
 
-    /// Are the BIOS and BMC currently locked down?
+    /// Whether full lockdown supports controls whose changes take effect at
+    /// host boot. This is a capability query: it ignores configured values,
+    /// pending changes, and previous calls, and does not indicate that a reboot
+    /// is currently needed. Callers must track policy application and completed
+    /// reboots separately. The default is false; other vendor reboot needs are
+    /// outside this capability.
+    fn lockdown_has_boot_latched_controls<'a>(
+        &'a self,
+    ) -> RedfishFuture<'a, Result<bool, RedfishError>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Read lockdown status. Depending on the platform, this reports configured
+    /// policy rather than effective protection until a required reboot completes.
     fn lockdown_status<'a>(&'a self) -> RedfishFuture<'a, Result<Status, RedfishError>> {
         <standard::RedfishStandard as Redfish>::lockdown_status(self.std_redfish())
     }
@@ -857,6 +883,8 @@ pub trait Redfish: Send + Sync + 'static {
         <standard::RedfishStandard as Redfish>::get_base_mac_address(self.std_redfish())
     }
 
+    /// Temporarily change BMC lockdown. Lenovo changes the supported firmware
+    /// and BIOS-settings locks while preserving host runtime EFI protection.
     fn lockdown_bmc<'a>(
         &'a self,
         target: EnabledDisabled,
