@@ -153,6 +153,32 @@ fn discovery(firmware: Value, bios: Value) -> Vec<Request> {
 }
 
 #[tokio::test]
+async fn ipmi_account_access_preserves_account_types_and_skips_unnecessary_writes() {
+    const ACCOUNT: &str = "AccountService/Accounts/1";
+    for (account, write) in [
+        (json!({}), None),
+        (json!({"AccountTypes":["Redfish", "IPMI"]}), None),
+        (
+            json!({"AccountTypes":["Redfish", "WebUI", "VendorSpecific"]}),
+            Some(json!({
+                "Password":"current-test-password",
+                "AccountTypes":["Redfish", "WebUI", "VendorSpecific", "IPMI"]
+            })),
+        ),
+    ] {
+        let mut script = vec![get(ACCOUNT, account)];
+        if let Some(body) = write {
+            script.push(patch(ACCOUNT, body));
+        }
+        let (bmc, server) = client(script).await;
+        bmc.enable_ipmi_account_access("1", "current-test-password")
+            .await
+            .unwrap();
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn optional_controls_are_discovered_independently_and_writes_are_idempotent() {
     for (security, bios, writes) in [
         (json!({}), json!({}), vec![]),

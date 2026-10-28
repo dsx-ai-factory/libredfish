@@ -126,6 +126,17 @@ pub trait Redfish: Send + Sync + 'static {
         )
     }
 
+    /// Restore account-level IPMI access after changing the factory password.
+    /// The client must authenticate with `password`, the account's current password.
+    /// Vendors without this requirement do nothing.
+    fn enable_ipmi_account_access<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _password: &'a str,
+    ) -> RedfishFuture<'a, Result<(), RedfishError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// List current user accounts
     fn get_accounts<'a>(&'a self) -> RedfishFuture<'a, Result<Vec<ManagerAccount>, RedfishError>> {
         <standard::RedfishStandard as Redfish>::get_accounts(self.std_redfish())

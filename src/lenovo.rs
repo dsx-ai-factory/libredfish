@@ -77,6 +77,36 @@ impl Bmc {
     }
 }
 impl Redfish for Bmc {
+    fn enable_ipmi_account_access<'a>(
+        &'a self,
+        account_id: &'a str,
+        password: &'a str,
+    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
+        Box::pin(async move {
+            let url = format!("AccountService/Accounts/{account_id}");
+            let (_, mut account): (_, HashMap<String, Value>) = self.s.client.get(&url).await?;
+            if !account.contains_key("AccountTypes") {
+                return Ok(());
+            }
+            let mut account_types: Vec<String> =
+                jsonmap::extract(&mut account, "AccountTypes", &url)?;
+            if account_types.iter().any(|value| value == "IPMI") {
+                return Ok(());
+            }
+            account_types.push("IPMI".to_string());
+            // XCC3 requires this separate request, authenticated with the new
+            // password, and requires the current password in the PATCH body.
+            self.s
+                .client
+                .patch(
+                    &url,
+                    serde_json::json!({"Password": password, "AccountTypes": account_types}),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
     fn std_redfish(&self) -> &RedfishStandard {
         &self.s
     }
