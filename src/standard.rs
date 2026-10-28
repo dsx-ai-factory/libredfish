@@ -565,6 +565,28 @@ impl Redfish for RedfishStandard {
         Box::pin(async move { self.get_members("TaskService/Tasks/").await })
     }
 
+    fn cancel_task<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
+        Box::pin(async move {
+            // Cancel this task, rather than touching the component's shared evidence endpoint.
+            let url = format!("TaskService/Tasks/{id}");
+            match self.client.delete(&url).await {
+                Ok(status) => Ok(status != StatusCode::ACCEPTED),
+                Err(RedfishError::HTTPErrorCode {
+                    status_code: StatusCode::NOT_FOUND | StatusCode::GONE,
+                    ..
+                }) => Ok(true),
+                Err(RedfishError::HTTPErrorCode {
+                    status_code: StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED,
+                    ..
+                }) => Err(RedfishError::NotSupported("task cancellation".to_string())),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     /// http://redfish.dmtf.org/schemas/v1/TaskCollection.json
     fn get_task<'a>(&'a self, id: &'a str) -> crate::RedfishFuture<'a, Result<Task, RedfishError>> {
         Box::pin(async move {
