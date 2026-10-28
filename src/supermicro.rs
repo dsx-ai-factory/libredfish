@@ -102,6 +102,19 @@ fn redfish_relative_path(uri: &str) -> &str {
     uri.strip_prefix("/redfish/v1/").unwrap_or(uri)
 }
 
+/// The `ComputerSystem.Reset` ActionInfo URI. `None` when the action has no
+/// usable target, because then there is nothing to post.
+fn reset_action_info_uri(system: &serde_json::Value) -> Option<&str> {
+    let reset = system.pointer("/Actions/#ComputerSystem.Reset")?;
+    reset
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .filter(|target| !target.is_empty())?;
+    reset
+        .get("@Redfish.ActionInfo")
+        .and_then(serde_json::Value::as_str)
+}
+
 fn allows_full_power_cycle(allowable_values: Option<&serde_json::Value>) -> bool {
     allowable_values
         .and_then(serde_json::Value::as_array)
@@ -807,10 +820,7 @@ impl Bmc {
         if let Some(request) = select_ac_power_cycle_request(&system, None) {
             return Ok(Some(request));
         }
-        let Some(info_uri) = system
-            .pointer("/Actions/#ComputerSystem.Reset/@Redfish.ActionInfo")
-            .and_then(serde_json::Value::as_str)
-        else {
+        let Some(info_uri) = reset_action_info_uri(&system) else {
             return Ok(None);
         };
         let (_, info) = self
@@ -1787,6 +1797,33 @@ mod tests {
                 assert_eq!(set.get(key), Some(&value), "{case}: {key}");
             }
             assert!(!set.contains_key("Re_SizeBARSupport"), "{case}");
+        }
+    }
+
+    #[test]
+    fn reset_action_info_uri_needs_a_usable_target() {
+        let info = "/redfish/v1/Systems/1/ResetActionInfo";
+        for (case, reset, expected) in [
+            (
+                "target and ActionInfo",
+                json!({ "target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+                    "@Redfish.ActionInfo": info }),
+                Some(info),
+            ),
+            ("no target", json!({ "@Redfish.ActionInfo": info }), None),
+            (
+                "empty target",
+                json!({ "target": "", "@Redfish.ActionInfo": info }),
+                None,
+            ),
+            (
+                "no ActionInfo",
+                json!({ "target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset" }),
+                None,
+            ),
+        ] {
+            let system = json!({ "Actions": { "#ComputerSystem.Reset": reset } });
+            assert_eq!(reset_action_info_uri(&system), expected, "{case}");
         }
     }
 
