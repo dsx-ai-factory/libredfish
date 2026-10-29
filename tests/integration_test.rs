@@ -469,6 +469,17 @@ async fn run_integration_test(
             .power(libredfish::SystemPowerControl::ForceRestart)
             .await?;
     }
+
+    // The Supermicro mockup advertises neither the OEM ACCycle reset nor the
+    // FullPowerCycle reset type (its ResetActionInfo lists only PowerCycle).
+    if vendor_dir == "supermicro" {
+        assert!(matches!(
+            redfish
+                .power(libredfish::SystemPowerControl::ACPowercycle)
+                .await,
+            Err(libredfish::RedfishError::NotSupported(_))
+        ));
+    }
     if vendor_dir == "dell" {
         // we're testing against static files, so these don't change
         assert!(redfish.lockdown_status().await?.is_fully_disabled());
