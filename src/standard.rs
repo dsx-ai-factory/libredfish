@@ -581,7 +581,6 @@ impl Redfish for RedfishStandard {
                     err: InvalidValueError("Expected a single task identifier".to_string()),
                 });
             }
-            // Cancel this task, rather than touching the component's shared evidence endpoint.
             let url = format!("TaskService/Tasks/{}", urlencoding::encode(id));
             match self.client.delete(&url).await {
                 Ok(status) => Ok(status != StatusCode::ACCEPTED),
