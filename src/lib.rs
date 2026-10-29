@@ -188,6 +188,16 @@ pub trait Redfish: Send + Sync + 'static {
         <standard::RedfishStandard as Redfish>::get_task(self.std_redfish(), id)
     }
 
+    /// Requests cancellation of one task by its TaskService task ID.
+    ///
+    /// Returns `true` when cancellation completed synchronously or the task no longer
+    /// exists (HTTP 404/410), and `false` for HTTP 202 Accepted. An accepted request
+    /// must be polled with `get_task` until the task stops or disappears.
+    /// HTTP 405/501 returns `RedfishError::NotSupported`; other failures propagate.
+    fn cancel_task<'a>(&'a self, id: &'a str) -> RedfishFuture<'a, Result<bool, RedfishError>> {
+        <standard::RedfishStandard as Redfish>::cancel_task(self.std_redfish(), id)
+    }
+
     /// Is this thing even on?
     fn get_power_state<'a>(&'a self) -> RedfishFuture<'a, Result<PowerState, RedfishError>> {
         <standard::RedfishStandard as Redfish>::get_power_state(self.std_redfish())

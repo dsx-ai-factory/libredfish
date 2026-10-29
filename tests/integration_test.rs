@@ -53,6 +53,7 @@ const PYTHON_VENV_DIR: &str = "libredfish-python-venv";
 
 // Ports we hope are not in use
 const GENERIC_PORT: &str = "8732";
+const TASK_CANCELLATION_PORT: &str = "8746";
 const DELL_PORT: &str = "8733";
 const HPE_PORT: &str = "8734";
 const LENOVO_PORT: &str = "8735";
@@ -139,6 +140,66 @@ async fn test_nvidia_gbswitch() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_nvidia_gh200() -> Result<(), anyhow::Error> {
     run_integration_test("nvidia_gh200", NVIDIA_GH200_PORT).await
+}
+
+#[tokio::test]
+async fn test_task_cancellation() -> anyhow::Result<()> {
+    // Use the real HTTP client against the existing TLS mock server. Only DELETE
+    // has canned responses at these task paths, so this also checks the method.
+    let _server = run_mockup_server("task_cancellation", TASK_CANCELLATION_PORT)?;
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let client = pool.create_standard_client(libredfish::Endpoint {
+        host: "127.0.0.1".to_string(),
+        port: Some(TASK_CANCELLATION_PORT.parse()?),
+        ..Default::default()
+    })?;
+    for (task_id, expected) in [
+        ("completed", Ok(true)),
+        ("pending", Ok(false)),
+        ("task ?#%2e%2e-é", Ok(false)),
+        ("missing", Ok(true)),
+        ("unsupported", Err("unsupported")),
+        ("failed", Err("http_503")),
+    ] {
+        let result = client
+            .cancel_task(task_id)
+            .await
+            .map_err(|error| match error {
+                libredfish::RedfishError::NotSupported(_) => "unsupported",
+                libredfish::RedfishError::HTTPErrorCode { status_code, .. }
+                    if status_code == 503 =>
+                {
+                    "http_503"
+                }
+                error => panic!("unexpected cancellation failure for {task_id}: {error}"),
+            });
+        assert_eq!(result, expected, "task {task_id}");
+    }
+    for task_id in [
+        "",
+        ".",
+        "..",
+        "../Managers/1",
+        "../../ComponentIntegrity/1",
+        "/redfish/v1/TaskService/Tasks/completed",
+        "completed/child",
+        "completed/",
+        r"..\Managers\1",
+        "\t..",
+        "completed\n",
+        "completed\0",
+    ] {
+        assert!(
+            matches!(
+                client.cancel_task(task_id).await,
+                Err(libredfish::RedfishError::InvalidValue { .. })
+            ),
+            "expected invalid task identifier: {task_id:?}"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]

@@ -892,6 +892,12 @@ class RfMockupServer(BaseHTTPRequestHandler):
         logger.info("DELETE: Headers: {}".format(self.headers))
         self.try_to_sleep("DELETE", self.path)
 
+        # Model asynchronous cancellation and unsupported task deletion, as for PATCH.
+        response_path = self.construct_path(self.path, "delete_response.json")
+        if os.path.isfile(response_path):
+            self.send_response_file(response_path)
+            return
+
         fpath = self.construct_path(self.path, "index.json")
         ppath = "/".join(self.path.split("/")[:-1])
         parent_path = self.construct_path(ppath, "index.json")
