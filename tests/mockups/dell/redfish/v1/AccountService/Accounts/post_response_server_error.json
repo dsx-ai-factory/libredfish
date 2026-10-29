@@ -1,0 +1,5 @@
+{
+    "match_request_body_contains": "server_error_user",
+    "status": 500,
+    "body": "fixture Dell collection POST error"
+}
