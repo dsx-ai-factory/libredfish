@@ -442,7 +442,7 @@ pub trait Redfish: Send + Sync + 'static {
 
     /// Lock the BIOS and BMC ready for tenant use. Disabled reverses the changes.
     /// This applies configuration; it does not reboot the host. Some controls,
-    /// including Lenovo UEFIVariablesRO, take effect only at the next host boot.
+    /// depending on the platform, take effect only at the next host boot.
     fn lockdown<'a>(
         &'a self,
         target: EnabledDisabled,
@@ -895,7 +895,7 @@ pub trait Redfish: Send + Sync + 'static {
     }
 
     /// Temporarily change BMC lockdown. Lenovo changes the supported firmware
-    /// and BIOS-settings locks while preserving host runtime EFI protection.
+    /// and BIOS settings locks without changing the legacy controls.
     fn lockdown_bmc<'a>(
         &'a self,
         target: EnabledDisabled,
