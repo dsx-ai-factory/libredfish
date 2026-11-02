@@ -68,7 +68,6 @@ pub struct Bmc {
 struct XccLockdown {
     firmware: Option<bool>,
     settings: Option<bool>,
-    uefi_variables: Option<bool>,
 }
 
 impl Bmc {
@@ -363,19 +362,9 @@ impl Redfish for Bmc {
         &'a self,
         target: EnabledDisabled,
     ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
-        // Runtime EFI protection is latched at host boot. Temporary BMC
-        // operations must preserve it rather than stage an unapplied change.
-        Box::pin(async move { self.set_xcc_lockdown(target, false).await })
+        Box::pin(async move { self.set_xcc_lockdown(target).await })
     }
 
-    fn lockdown_has_boot_latched_controls<'a>(
-        &'a self,
-    ) -> crate::RedfishFuture<'a, Result<bool, RedfishError>> {
-        Box::pin(async move { Ok(self.get_bios_lockdown().await?.uefi_variables.is_some()) })
-    }
-
-    /// Reports configured policy. UEFIVariablesRO enforcement changes only
-    /// after a host reboot, which cannot be verified from this resource.
     fn lockdown_status<'a>(&'a self) -> crate::RedfishFuture<'a, Result<Status, RedfishError>> {
         Box::pin(async move {
             let kcs = self.get_kcs_lenovo().await?;
@@ -389,14 +378,8 @@ impl Redfish for Bmc {
                 Some(false) => "false",
                 None => "unsupported",
             };
-            let runtime = match xcc.uefi_variables {
-                Some(locked) => format!(
-                    "{locked} (configured; effective_state=unknown; changes_apply_at_host_boot)"
-                ),
-                None => "unsupported".to_string(),
-            };
             let message = format!(
-                "kcs={kcs}, firmware_rollback={firmware_rollback}, ethernet_over_usb={eth_usb}, front_panel_usb={}/{}, fw_lockdown={}, settings_lockdown={}, uefi_variables_ro={runtime}",
+                "kcs={kcs}, firmware_rollback={firmware_rollback}, ethernet_over_usb={eth_usb}, front_panel_usb={}/{}, fw_lockdown={}, settings_lockdown={}",
                 front_usb.fp_mode, front_usb.port_switching_to,
                 value(xcc.firmware), value(xcc.settings),
             );
@@ -405,7 +388,7 @@ impl Redfish for Bmc {
                 && !eth_usb
                 && firmware_rollback == EnabledDisabled::Disabled
                 && front_usb.fp_mode == lenovo::FrontPanelUSBMode::Server
-                && [xcc.firmware, xcc.settings, xcc.uefi_variables]
+                && [xcc.firmware, xcc.settings]
                     .into_iter()
                     .flatten()
                     .all(|locked| locked);
@@ -415,7 +398,7 @@ impl Redfish for Bmc {
                 && firmware_rollback == EnabledDisabled::Enabled
                 && front_usb.fp_mode == lenovo::FrontPanelUSBMode::Shared
                 && front_usb.port_switching_to == lenovo::PortSwitchingMode::Server
-                && [xcc.firmware, xcc.settings, xcc.uefi_variables]
+                && [xcc.firmware, xcc.settings]
                     .into_iter()
                     .flatten()
                     .all(|locked| !locked);
@@ -1075,14 +1058,13 @@ impl Bmc {
         .inspect_err(|err| {
             debug!(%err, "Failed locking front panel USB to host-only.");
         })?;
-        self.set_xcc_lockdown(EnabledDisabled::Enabled, true).await
+        self.set_xcc_lockdown(EnabledDisabled::Enabled).await
     }
 
     /// Unlock a Lenovo server, restoring defaults
     pub async fn disable_lockdown(&self) -> Result<(), RedfishError> {
         // Release the BIOS settings lock before restoring legacy settings.
-        self.set_xcc_lockdown(EnabledDisabled::Disabled, true)
-            .await?;
+        self.set_xcc_lockdown(EnabledDisabled::Disabled).await?;
         self.set_kcs_lenovo(true).await.inspect_err(|err| {
             debug!(%err, "Failed enabling 'IPMI over KCS Access'");
         })?;
@@ -1134,10 +1116,6 @@ impl Bmc {
                 .map(|oem| optional_lockdown_bool(oem, "SettingsLockdown", &bios_url))
                 .transpose()?
                 .flatten(),
-            uefi_variables: lenovo
-                .map(|oem| optional_lockdown_bool(oem, "UEFIVariablesRO", &bios_url))
-                .transpose()?
-                .flatten(),
         })
     }
 
@@ -1155,11 +1133,7 @@ impl Bmc {
         }
     }
 
-    async fn set_xcc_lockdown(
-        &self,
-        target: EnabledDisabled,
-        include_runtime_variables: bool,
-    ) -> Result<(), RedfishError> {
+    async fn set_xcc_lockdown(&self, target: EnabledDisabled) -> Result<(), RedfishError> {
         let controls = self.get_xcc_lockdown().await?;
         let locked = target == EnabledDisabled::Enabled;
         let security_url = format!("Managers/{}/Oem/Lenovo/Security", self.s.manager_id());
@@ -1171,18 +1145,9 @@ impl Bmc {
                 .await?;
         }
         let mut bios_controls = HashMap::new();
-        for (name, current) in [
-            ("SettingsLockdown", controls.settings),
-            (
-                "UEFIVariablesRO",
-                controls
-                    .uefi_variables
-                    .filter(|_| include_runtime_variables),
-            ),
-        ] {
-            if current.is_some_and(|current| current != locked) {
-                bios_controls.insert(name, locked);
-            }
+        // Do not manage runtime EFI protection: tenants need to register boot entries.
+        if controls.settings.is_some_and(|current| current != locked) {
+            bios_controls.insert("SettingsLockdown", locked);
         }
         if !bios_controls.is_empty() {
             let bios_url = format!("Systems/{}/Bios", self.s.system_id());

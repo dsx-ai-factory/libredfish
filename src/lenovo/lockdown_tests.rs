@@ -241,49 +241,9 @@ async fn unlock_firmware_before_bios_and_lock_firmware_last() {
 }
 
 #[tokio::test]
-async fn boot_latched_capability_uses_only_bios_and_ignores_configured_state() {
-    for (bios, expected) in [
-        (json!({}), false),
-        (json!({"Oem":{"Lenovo":{"SettingsLockdown":true}}}), false),
-        (json!({"Oem":{"Lenovo":{"UEFIVariablesRO":false}}}), true),
-        (json!({"Oem":{"Lenovo":{"UEFIVariablesRO":true}}}), true),
-    ] {
-        let (bmc, server) = client(vec![get(BIOS, bios)]).await;
-        assert_eq!(
-            bmc.lockdown_has_boot_latched_controls().await.unwrap(),
-            expected
-        );
-        server.finish().await;
-    }
-
-    let script = vec![
-        get(BIOS, json!({})),
-        get(BIOS, json!({"Oem":{"Lenovo":{"UEFIVariablesRO":false}}})),
-    ];
-    let (bmc, server) = client(script).await;
+async fn lockdown_does_not_require_boot_latched_controls() {
+    let (bmc, server) = client(vec![]).await;
     assert!(!bmc.lockdown_has_boot_latched_controls().await.unwrap());
-    assert!(bmc.lockdown_has_boot_latched_controls().await.unwrap());
-    server.finish().await;
-
-    for code in [401, 403, 500, 404] {
-        let mut response = get(BIOS, json!({}));
-        response.status = code;
-        let (bmc, server) = client(vec![response]).await;
-        let result = bmc.lockdown_has_boot_latched_controls().await;
-        if code == 404 {
-            assert!(!result.unwrap());
-        } else {
-            assert!(result.is_err());
-        }
-        server.finish().await;
-    }
-
-    let (bmc, server) = client(vec![get(
-        BIOS,
-        json!({"Oem":{"Lenovo":{"UEFIVariablesRO":null}}}),
-    )])
-    .await;
-    assert!(bmc.lockdown_has_boot_latched_controls().await.is_err());
     server.finish().await;
 }
 
@@ -313,10 +273,6 @@ async fn malformed_properties_and_failed_reads_are_not_unsupported() {
         (json!({}), json!({"Oem":null})),
         (json!({}), json!({"Oem":{"Lenovo":false}})),
         (json!({}), json!({"Oem":{"Lenovo":{"SettingsLockdown":0}}})),
-        (
-            json!({}),
-            json!({"Oem":{"Lenovo":{"UEFIVariablesRO":"true"}}}),
-        ),
     ] {
         let (bmc, server) = client(discovery(security, bios)).await;
         assert!(bmc.lockdown_bmc(EnabledDisabled::Enabled).await.is_err());
@@ -381,7 +337,7 @@ async fn status_requires_all_supported_controls_and_preserves_old_firmware_statu
         (
             true,
             json!({"FWLockdown":true}),
-            json!({"Oem":{"Lenovo":{"SettingsLockdown":true,"UEFIVariablesRO":true}}}),
+            json!({"Oem":{"Lenovo":{"SettingsLockdown":true,"UEFIVariablesRO":false}}}),
             StatusInternal::Enabled,
         ),
         (
@@ -400,28 +356,21 @@ async fn status_requires_all_supported_controls_and_preserves_old_firmware_statu
             true,
             json!({}),
             json!({"Oem":{"Lenovo":{"UEFIVariablesRO":false}}}),
-            StatusInternal::Partial,
+            StatusInternal::Enabled,
+        ),
+        (
+            false,
+            json!({"FWLockdown":false}),
+            json!({"Oem":{"Lenovo":{"SettingsLockdown":false,"UEFIVariablesRO":true}}}),
+            StatusInternal::Disabled,
         ),
     ] {
         let mut script = legacy_status(legacy_locked);
-        let runtime = bios
-            .pointer("/Oem/Lenovo/UEFIVariablesRO")
-            .and_then(Value::as_bool);
         script.extend(discovery(security, bios));
         let (bmc, server) = client(script).await;
         let status = bmc.lockdown_status().await.unwrap();
         assert_eq!(status.status, expected);
-        let runtime_message = match runtime {
-            Some(locked) => format!(
-                "uefi_variables_ro={locked} (configured; effective_state=unknown; changes_apply_at_host_boot)"
-            ),
-            None => "uefi_variables_ro=unsupported".to_string(),
-        };
-        assert!(
-            status.message.contains(&runtime_message),
-            "{}",
-            status.message
-        );
+        assert!(!status.message.contains("uefi_variables_ro="));
         assert!(status.message.contains("fw_lockdown="));
         assert!(status.message.contains("settings_lockdown="));
         assert!(!status.message.contains("XccLockdown"));
@@ -466,10 +415,7 @@ async fn full_lockdown_preserves_legacy_writes_and_unlocks_new_controls_before_t
             };
             if supported {
                 let fw = patch(SECURITY, json!({"FWLockdown":locked}));
-                let bios = patch(
-                    BIOS,
-                    json!({"Oem":{"Lenovo":{"SettingsLockdown":locked,"UEFIVariablesRO":locked}}}),
-                );
+                let bios = patch(BIOS, json!({"Oem":{"Lenovo":{"SettingsLockdown":locked}}}));
                 xcc.extend(if locked {
                     vec![bios, fw]
                 } else {
