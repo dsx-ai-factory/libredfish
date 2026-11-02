@@ -929,7 +929,7 @@ impl Bmc {
             };
         }
         add_keys!("QuietBoot", false);
-        add_keys!("Re_tryBoot", "EFI Boot");
+        // Retry Boot values vary by firmware; preserve the current setting.
         add_keys!("CSMSupport", "Disabled");
         add_keys!("SecureBootEnable", false);
 
@@ -1754,6 +1754,33 @@ mod tests {
     }
 
     #[test]
+    fn machine_setup_does_not_enforce_retry_boot() {
+        for (case, key, current) in [
+            ("binary disabled", "Re_tryBoot", "Disabled"),
+            ("binary enabled", "Re_tryBoot", "Enabled"),
+            ("suffixed", "Re_tryBoot_0032", "Disabled"),
+        ] {
+            let mut attrs = json!({"SecurityDeviceSupport": "Enabled"})
+                .as_object()
+                .unwrap()
+                .clone();
+            attrs.insert(key.to_string(), json!(current));
+
+            // Status checks use this same desired-attribute list.
+            let expected = Bmc::machine_setup_attrs(&attrs).unwrap();
+            assert!(
+                expected.iter().all(|(name, _)| name != key),
+                "{case}: Retry Boot must not be required"
+            );
+            let changed = Bmc::changed_machine_setup_attrs(&attrs).unwrap();
+            assert!(
+                !changed.contains_key(key),
+                "{case}: Retry Boot must not be written"
+            );
+        }
+    }
+
+    #[test]
     fn machine_setup_attrs_sets_suffixed_and_unsuffixed_names() {
         for (case, attrs, expected) in [
             (
@@ -1766,7 +1793,6 @@ mod tests {
                     "SecurityDeviceSupport": "Enable",
                 }),
                 vec![
-                    ("Re_tryBoot", json!("EFI Boot")),
                     ("IntelVTforDirectedI_O_VT_d_", json!("Enable")),
                     ("SR_IOVSupport", json!("Enabled")),
                 ],
@@ -1781,7 +1807,6 @@ mod tests {
                     "SecurityDeviceSupport_002D": "Disabled",
                 }),
                 vec![
-                    ("Re_tryBoot_0032", json!("EFI Boot")),
                     ("IntelVTforDirectedI_O_VT_d__1E32", json!("Enable")),
                     ("SR_IOVSupport_002B", json!("Enabled")),
                     ("SR_IOVSupport_0057", json!("Enabled")),
