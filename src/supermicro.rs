@@ -306,11 +306,11 @@ impl Redfish for Bmc {
     fn machine_setup<'a>(
         &'a self,
         _boot_interface: Option<crate::BootInterfaceRef<'a>>,
-        _bios_profiles: &'a HashMap<
+        bios_profiles: &'a HashMap<
             RedfishVendor,
             HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
         >,
-        _selected_profile: BiosProfileType,
+        selected_profile: BiosProfileType,
         _oem_manager_profiles: &'a HashMap<
             RedfishVendor,
             HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
@@ -320,8 +320,24 @@ impl Redfish for Bmc {
             self.setup_serial_console().await?;
 
             let bios = self.s.bios().await?;
-            let attrs =
-                Self::changed_machine_setup_attrs(bios_attributes(&bios, self.s.system_id())?)?;
+            let current_attrs = bios_attributes(&bios, self.s.system_id())?;
+            let mut attrs = Self::changed_machine_setup_attrs(current_attrs)?;
+            if let Some(supermicro) = bios_profiles.get(&RedfishVendor::Supermicro) {
+                let model = crate::model_coerce(
+                    self.get_system()
+                        .await?
+                        .model
+                        .unwrap_or("".to_string())
+                        .as_str(),
+                );
+                if let Some(extra_values) = supermicro
+                    .get(&model)
+                    .and_then(|profiles| profiles.get(&selected_profile))
+                {
+                    tracing::debug!("Setting extra BIOS values: {extra_values:?}");
+                    attrs.extend(Self::changed_profile_attrs(current_attrs, extra_values));
+                }
+            }
             if attrs.is_empty() {
                 return Ok(None);
             }
@@ -1000,6 +1016,28 @@ impl Bmc {
             .into_iter()
             .filter(|(key, expected)| current_attrs.get(key) != Some(expected))
             .collect())
+    }
+
+    /// Site-configured BIOS values for this model, matched to this BIOS's
+    /// attribute names. Names the BIOS does not expose are skipped.
+    fn changed_profile_attrs(
+        current_attrs: &serde_json::Map<String, serde_json::Value>,
+        extra_values: &HashMap<String, serde_json::Value>,
+    ) -> HashMap<String, serde_json::Value> {
+        let bios_keys = Self::bios_attributes_name_map(current_attrs);
+        let mut attrs = HashMap::new();
+        for (name, value) in extra_values {
+            let Some(real_keys) = bios_keys.get(bios_attribute_name(name)) else {
+                tracing::warn!("BIOS profile attribute {name} not found; skipping");
+                continue;
+            };
+            for real_key in real_keys {
+                if current_attrs.get(real_key) != Some(value) {
+                    attrs.insert(real_key.clone(), value.clone());
+                }
+            }
+        }
+        attrs
     }
 
     async fn get_kcs_privilege(&self) -> Result<Option<supermicro::Privilege>, RedfishError> {
@@ -1778,6 +1816,40 @@ mod tests {
                 "{case}: Retry Boot must not be written"
             );
         }
+    }
+
+    #[test]
+    fn changed_profile_attrs_matches_bios_names() {
+        let attrs = json!({
+            "Re_tryBoot_0032": "Disabled",
+            "QuietBoot": false,
+            "SecurityDeviceSupport": "Enabled",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let extra_values = HashMap::from([
+            ("Re_tryBoot".to_string(), json!("Enabled")),
+            ("QuietBoot".to_string(), json!(false)),
+            ("NotOnThisBios".to_string(), json!("Enabled")),
+        ]);
+
+        let changed = Bmc::changed_profile_attrs(&attrs, &extra_values);
+
+        assert_eq!(
+            changed,
+            HashMap::from([("Re_tryBoot_0032".to_string(), json!("Enabled"))])
+        );
+    }
+
+    #[test]
+    fn changed_profile_attrs_is_empty_without_profile() {
+        let attrs = json!({"Re_tryBoot": "Disabled"})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        assert!(Bmc::changed_profile_attrs(&attrs, &HashMap::new()).is_empty());
     }
 
     #[test]
