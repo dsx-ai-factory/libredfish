@@ -58,6 +58,7 @@ const DELL_PORT: &str = "8733";
 const HPE_PORT: &str = "8734";
 const LENOVO_PORT: &str = "8735";
 const NVIDIA_DPU_PORT: &str = "8736";
+const NVIDIA_DPU_BF4_PORT: &str = "8747";
 const NVIDIA_VIKING_PORT: &str = "8737";
 const SUPERMICRO_PORT: &str = "8738";
 const DELL_MULTI_DPU_PORT: &str = "8739";
@@ -109,6 +110,31 @@ async fn test_lenovo() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_nvidia_dpu() -> Result<(), anyhow::Error> {
     run_integration_test("nvidia_dpu", NVIDIA_DPU_PORT).await
+}
+
+#[tokio::test]
+async fn test_nvidia_dpu_bf4_restart() -> anyhow::Result<()> {
+    // Models BF4-26.10-0007: `Systems/BlueField_0` has no `ComputerSystem.Reset`
+    // and `Chassis/BlueField_0` does not advertise `NvidiaChassis.Reset`. The mock
+    // accepts that OEM action only with the body {"ResetType": "ArmReset"}, and
+    // deliberately fails every POST to the standard `Chassis.Reset` so the test
+    // pins the OEM path: 26.10-0007 advertises `PowerCycle` there, which a DPU
+    // restart must never send.
+    let _server = run_mockup_server("nvidia_dpu_bf4", NVIDIA_DPU_BF4_PORT)?;
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let redfish = pool
+        .create_client(libredfish::Endpoint {
+            host: "127.0.0.1".to_string(),
+            port: Some(NVIDIA_DPU_BF4_PORT.parse()?),
+            ..Default::default()
+        })
+        .await?;
+    redfish
+        .power(libredfish::SystemPowerControl::ForceRestart)
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]

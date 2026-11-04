@@ -1,0 +1,7 @@
+{
+    "status": 400,
+    "headers": {
+        "Content-Type": "application/json"
+    },
+    "body": "{\"error\":{\"@Message.ExtendedInfo\":[{\"@odata.type\":\"#Message.v1_1_1.Message\",\"Message\":\"The parameter ResetType for the action Chassis.Reset is not supported on the target resource.\",\"MessageArgs\":[\"ResetType\",\"Chassis.Reset\"],\"MessageId\":\"Base.1.18.1.ActionParameterNotSupported\",\"MessageSeverity\":\"Warning\",\"Resolution\":\"Remove the parameter supplied and resubmit the request if the operation failed.\"}],\"code\":\"Base.1.18.1.ActionParameterNotSupported\",\"message\":\"The parameter ResetType for the action Chassis.Reset is not supported on the target resource.\"}}"
+}

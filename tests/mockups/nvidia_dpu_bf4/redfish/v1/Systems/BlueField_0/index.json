@@ -1,0 +1,7 @@
+{
+    "@odata.id": "/redfish/v1/Systems/BlueField_0",
+    "@odata.type": "#ComputerSystem.v1_22_0.ComputerSystem",
+    "Id": "BlueField_0",
+    "Name": "BlueField_0",
+    "PowerState": "On"
+}

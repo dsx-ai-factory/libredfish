@@ -1,0 +1,18 @@
+{
+    "@odata.id": "/redfish/v1",
+    "@odata.type": "#ServiceRoot.v1_15_0.ServiceRoot",
+    "Chassis": {
+        "@odata.id": "/redfish/v1/Chassis"
+    },
+    "Id": "RootService",
+    "Managers": {
+        "@odata.id": "/redfish/v1/Managers"
+    },
+    "Name": "Root Service",
+    "Product": "BlueField-4",
+    "RedfishVersion": "1.17.0",
+    "Systems": {
+        "@odata.id": "/redfish/v1/Systems"
+    },
+    "Vendor": "Nvidia"
+}

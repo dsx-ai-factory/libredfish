@@ -1,0 +1,8 @@
+{
+    "match_request_body_contains": "{\"ResetType\": \"ArmReset\"}",
+    "status": 200,
+    "headers": {
+        "Content-Type": "application/json"
+    },
+    "body": "{\"@Message.ExtendedInfo\":[{\"@odata.type\":\"#Message.v1_1_1.Message\",\"Message\":\"The request completed successfully.\",\"MessageArgs\":[],\"MessageId\":\"Base.1.18.1.Success\",\"MessageSeverity\":\"OK\",\"Resolution\":\"None.\"}]}"
+}

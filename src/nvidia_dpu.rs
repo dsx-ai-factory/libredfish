@@ -45,9 +45,26 @@ use crate::{
         BootOption,
     },
     standard::RedfishStandard,
-    BiosProfileType, NetworkDeviceFunction, Redfish, RedfishError,
+    BiosProfileType, NetworkDeviceFunction, Redfish, RedfishError, SystemPowerControl,
 };
 use crate::{EnabledDisabled, MachineSetupDiff, MachineSetupStatus};
+
+/// The BlueField-4 system id; BlueField-3 uses `Bluefield`.
+const BF4_SYSTEM_ID: &str = "BlueField_0";
+const BF4_CHASSIS_RESET_PATH: &str = "Chassis/BlueField_0/Actions/Oem/NvidiaChassis.Reset";
+
+/// The `NvidiaChassis.Reset` `ResetType` that performs `action` on system
+/// `system_id`, or `None` to use the standard `ComputerSystem.Reset`.
+fn bf4_chassis_reset_type(system_id: &str, action: SystemPowerControl) -> Option<&'static str> {
+    match action {
+        SystemPowerControl::ForceRestart | SystemPowerControl::GracefulRestart
+            if system_id == BF4_SYSTEM_ID =>
+        {
+            Some("ArmReset")
+        }
+        _ => None,
+    }
+}
 
 pub struct Bmc {
     s: RedfishStandard,
@@ -83,6 +100,33 @@ impl Redfish for Bmc {
         Box::pin(async move {
             let (_status_code, body) = self.s.client.get("Chassis/Card1/Power/").await?;
             Ok(body)
+        })
+    }
+
+    /// BlueField-4 BMC firmware BF4-26.10-0006 and later removed
+    /// `ComputerSystem.Reset` from `Systems/BlueField_0`, and on 26.07 it
+    /// returned success without resetting anything. BlueField-4 restarts
+    /// therefore post the OEM `NvidiaChassis.Reset` action with `ArmReset`,
+    /// which the BMC serves without advertising it, and never fall back to
+    /// `ComputerSystem.Reset`. `ArmReset` gracefully restarts only the
+    /// BlueField Arm; the BMC forces the reset if shutdown exceeds 3 minutes.
+    /// Other actions have no confirmed BlueField-4 equivalent, so they and
+    /// BlueField-3 (`Bluefield`) keep `ComputerSystem.Reset`.
+    fn power<'a>(
+        &'a self,
+        action: SystemPowerControl,
+    ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
+        Box::pin(async move {
+            if let Some(reset_type) = bf4_chassis_reset_type(self.s.system_id(), action) {
+                let args = HashMap::from([("ResetType", reset_type)]);
+                return self
+                    .s
+                    .client
+                    .post(BF4_CHASSIS_RESET_PATH, args)
+                    .await
+                    .map(|_resp| ());
+            }
+            self.s.power(action).await
         })
     }
 
@@ -907,5 +951,59 @@ impl Bmc {
         let url = format!("Systems/{}/Oem/Nvidia/Actions/Mode.Set", self.s.system_id());
 
         self.s.client.post(&url, data).await.map(|_resp| Ok(()))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arm_reset_only_for_bf4_restarts() {
+        for (case, system_id, action, expected) in [
+            (
+                "BF4 force restart",
+                "BlueField_0",
+                SystemPowerControl::ForceRestart,
+                Some("ArmReset"),
+            ),
+            (
+                "BF4 graceful restart",
+                "BlueField_0",
+                SystemPowerControl::GracefulRestart,
+                Some("ArmReset"),
+            ),
+            ("BF4 on", "BlueField_0", SystemPowerControl::On, None),
+            (
+                "BF4 force off",
+                "BlueField_0",
+                SystemPowerControl::ForceOff,
+                None,
+            ),
+            (
+                "BF4 graceful shutdown",
+                "BlueField_0",
+                SystemPowerControl::GracefulShutdown,
+                None,
+            ),
+            (
+                "BF4 power cycle",
+                "BlueField_0",
+                SystemPowerControl::PowerCycle,
+                None,
+            ),
+            (
+                "BF3 force restart",
+                "Bluefield",
+                SystemPowerControl::ForceRestart,
+                None,
+            ),
+        ] {
+            assert_eq!(
+                bf4_chassis_reset_type(system_id, action),
+                expected,
+                "{case}"
+            );
+        }
     }
 }
