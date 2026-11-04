@@ -79,6 +79,7 @@ fn patch(id: u8, status: u16) -> Request {
 struct Server(JoinHandle<()>);
 
 impl Server {
+    /// Requires every scripted request to arrive and every peer assertion to pass.
     async fn finish(mut self) {
         tokio::time::timeout(Duration::from_secs(5), &mut self.0)
             .await
@@ -93,6 +94,7 @@ impl Drop for Server {
     }
 }
 
+/// Binds an ephemeral HTTPS peer that rejects unexpected request order or payloads.
 async fn client(script: Vec<Request>) -> (Box<dyn Redfish>, Server) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -178,6 +180,7 @@ async fn create(redfish: &dyn Redfish) -> Result<(), RedfishError> {
         .await
 }
 
+/// Checks that callers retain the original response body as well as its status.
 fn assert_http_error(error: RedfishError, expected: u16) {
     match error {
         RedfishError::HTTPErrorCode {
@@ -193,6 +196,7 @@ fn assert_http_error(error: RedfishError, expected: u16) {
 }
 
 #[tokio::test]
+/// Each synchronous success response must finish without querying account slots.
 async fn modern_creation_posts_an_enabled_account_without_probing_slots() {
     for status in [200, 201, 204] {
         let (redfish, server) = client(vec![post(status)]).await;
@@ -202,6 +206,7 @@ async fn modern_creation_posts_an_enabled_account_without_probing_slots() {
 }
 
 #[tokio::test]
+/// A missing or unknown-state slot must never be treated as a disabled account.
 async fn legacy_creation_skips_missing_enabled_and_unknown_slots() {
     let mut missing = slot(3, None);
     missing.status = 404;
@@ -220,6 +225,7 @@ async fn legacy_creation_skips_missing_enabled_and_unknown_slots() {
 }
 
 #[tokio::test]
+/// Validation, authentication and server failures must not trigger another write.
 async fn post_errors_do_not_fall_back_to_slot_mutation() {
     for status in [400, 401, 403, 404, 429, 500] {
         let (redfish, server) = client(vec![post(status)]).await;
@@ -235,6 +241,7 @@ async fn post_errors_do_not_fall_back_to_slot_mutation() {
 }
 
 #[tokio::test]
+/// An unreadable account is not evidence that its slot can be overwritten.
 async fn legacy_slot_lookup_errors_stop_without_patching() {
     for status in [401, 403, 500] {
         let mut lookup = slot(3, None);
@@ -247,6 +254,7 @@ async fn legacy_slot_lookup_errors_stop_without_patching() {
 }
 
 #[tokio::test]
+/// A successful HTTP response with invalid account data must still stop fallback.
 async fn malformed_slot_response_is_not_an_available_account() {
     let mut lookup = slot(3, None);
     lookup.response = json!({});
@@ -259,6 +267,7 @@ async fn malformed_slot_response_is_not_an_available_account() {
 }
 
 #[tokio::test]
+/// A failed write must not lead to mutating another account.
 async fn legacy_patch_failure_is_returned_without_trying_another_slot() {
     for status in [400, 403, 500] {
         let (redfish, server) =
@@ -269,6 +278,7 @@ async fn legacy_patch_failure_is_returned_without_trying_another_slot() {
 }
 
 #[tokio::test]
+/// Both exhaustion cases must stop at the legacy account limit without a write.
 async fn legacy_full_or_missing_slots_report_too_many_users() {
     for missing in [false, true] {
         let mut script = vec![post(405)];
@@ -290,6 +300,7 @@ async fn legacy_full_or_missing_slots_report_too_many_users() {
 }
 
 #[tokio::test]
+/// Preserve the inclusive upper bound when only the final legacy slot is available.
 async fn legacy_creation_can_use_the_last_disabled_slot() {
     let mut script = vec![post(405)];
     script.extend((3..16).map(|id| slot(id, Some(true))));

@@ -102,6 +102,8 @@ impl Redfish for Bmc {
     fn std_redfish(&self) -> &RedfishStandard {
         &self.s
     }
+    /// Creates an enabled account through the collection, using preallocated
+    /// disabled slots only when older iDRAC firmware rejects POST with HTTP 405.
     fn create_user<'a>(
         &'a self,
         username: &'a str,
