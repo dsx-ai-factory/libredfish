@@ -1,5 +1,7 @@
 {
-    "match_request_body_contains": "{\"ResetType\": \"ArmReset\"}",
+    "match_request_body": {
+        "ResetType": "ArmReset"
+    },
     "status": 200,
     "headers": {
         "Content-Type": "application/json"
