@@ -102,6 +102,8 @@ impl Redfish for Bmc {
     fn std_redfish(&self) -> &RedfishStandard {
         &self.s
     }
+    /// Creates an enabled account through the collection, using preallocated
+    /// disabled slots only when older iDRAC firmware rejects POST with HTTP 405.
     fn create_user<'a>(
         &'a self,
         username: &'a str,
@@ -109,32 +111,38 @@ impl Redfish for Bmc {
         role_id: RoleId,
     ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
-            // Find an unused ID
-            // 'root' is typically ID 2 on an iDrac, and ID 1 might be special
-            let mut account_id = 3;
-            let mut is_free = false;
-            while !is_free && account_id <= MAX_ACCOUNT_ID {
-                let a = match self.s.get_account_by_id(&account_id.to_string()).await {
-                    Ok(a) => a,
-                    Err(_) => {
-                        is_free = true;
-                        break;
-                    }
-                };
-                if let Some(false) = a.enabled {
-                    is_free = true;
-                    break;
-                }
-                account_id += 1;
-            }
-            if !is_free {
-                return Err(RedfishError::TooManyUsers);
+            // Modern iDRACs create accounts through the collection. Older
+            // firmware rejects POST with 405 and needs a disabled account slot.
+            let account = serde_json::json!({
+                "UserName": username,
+                "Password": password,
+                "RoleId": role_id.to_string(),
+                "Enabled": true,
+            });
+            match self.s.client.post("AccountService/Accounts", account).await {
+                Ok(_) => return Ok(()),
+                Err(RedfishError::HTTPErrorCode { status_code, .. })
+                    if status_code == StatusCode::METHOD_NOT_ALLOWED => {}
+                Err(error) => return Err(error),
             }
 
-            // Edit that unused account to be ours. That's how iDrac account creation works.
-            self.s
-                .edit_account(account_id, username, password, role_id, true)
-                .await
+            // Keep IDs 1 and 2 untouched. Only edit a confirmed disabled account;
+            // a missing slot cannot be created by PATCH, and other errors must
+            // not be mistaken for an available slot.
+            for account_id in 3..=MAX_ACCOUNT_ID {
+                match self.s.get_account_by_id(&account_id.to_string()).await {
+                    Ok(account) if account.enabled == Some(false) => {
+                        return self
+                            .s
+                            .edit_account(account_id, username, password, role_id, true)
+                            .await;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.not_found() => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(RedfishError::TooManyUsers)
         })
     }
 

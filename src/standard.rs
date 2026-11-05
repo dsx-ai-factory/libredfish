@@ -1750,8 +1750,8 @@ impl RedfishStandard {
         Err(RedfishError::UserNotFound(username.to_string()))
     }
 
-    /// Dell ships with all sixteen user accounts populated but disabled.
-    /// To create an account we have to edit one of them.
+    /// Updates an existing numbered account, as required when creating users
+    /// on older Dell iDRAC firmware with preallocated account slots.
     pub async fn edit_account(
         &self,
         account_id: u8,
