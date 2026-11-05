@@ -37,7 +37,45 @@ pub struct Job {
     pub id: Option<String>,
     pub name: Option<String>,
     pub percent_complete: Option<u32>,
-    pub job_state: Option<TaskState>,
+    pub job_state: Option<JobState>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    New,
+    Starting,
+    Running,
+    Suspended,
+    Interrupted,
+    Pending,
+    Stopping,
+    Completed,
+    Cancelled,
+    Exception,
+    Service,
+    UserIntervention,
+    Continue,
+    #[serde(other)]
+    Unknown,
+}
+
+impl JobState {
+    pub fn as_task_state(self) -> Option<TaskState> {
+        Some(match self {
+            JobState::New => TaskState::New,
+            JobState::Starting => TaskState::Starting,
+            JobState::Running | JobState::Continue => TaskState::Running,
+            JobState::Suspended | JobState::UserIntervention => TaskState::Suspended,
+            JobState::Interrupted => TaskState::Interrupted,
+            JobState::Pending => TaskState::Pending,
+            JobState::Stopping => TaskState::Stopping,
+            JobState::Completed => TaskState::Completed,
+            JobState::Cancelled => TaskState::Cancelled,
+            JobState::Exception => TaskState::Exception,
+            JobState::Service => TaskState::Service,
+            JobState::Unknown => return None,
+        })
+    }
 }
 
 impl Job {
@@ -47,10 +85,40 @@ impl Job {
             id: self.id.clone().unwrap_or("".to_string()),
             messages: vec![],
             name: self.name.clone(),
-            task_state: self.job_state.clone(),
+            task_state: self.job_state.and_then(JobState::as_task_state),
             task_status: None,
             task_monitor: None,
             percent_complete: self.percent_complete,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_state_as_task_state() {
+        for (job_state, task_state) in [
+            ("Running", Some("Running")),
+            ("Completed", Some("Completed")),
+            ("Exception", Some("Exception")),
+            ("Continue", Some("Running")),
+            ("UserIntervention", Some("Suspended")),
+            ("Validating", None),
+        ] {
+            let job: Job = serde_json::from_value(serde_json::json!({
+                "@odata.id": "/redfish/v1/JobService/Jobs/FW_Update_1",
+                "@odata.type": "#Job.v1_2_4.Job",
+                "Id": "FW_Update_1",
+                "JobState": job_state,
+            }))
+            .unwrap();
+            assert_eq!(
+                job.as_task().task_state.map(|s| s.to_string()).as_deref(),
+                task_state,
+                "{job_state}"
+            );
         }
     }
 }

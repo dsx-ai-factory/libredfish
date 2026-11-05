@@ -44,14 +44,6 @@ impl std::fmt::Display for TaskState {
 }
 
 impl Task {
-    /// The Job URI an update Task hands its work to, from its
-    /// `Update.<version>.OperationTransitionedToJob` message.
-    ///
-    /// A MessageId is `RegistryName.MajorVersion.MinorVersion[.ErrataVersion].MessageKey`,
-    /// so the version is matched loosely: Lenovo XCC3 reports
-    /// `Update.1.0.1.OperationTransitionedToJob`. Once a Task transitions, its own
-    /// state stops tracking the update (the XCC3 Task is `Completed` while its Job
-    /// is still writing the image), so the Job must be followed instead.
     pub fn transitioned_job_uri(&self) -> Option<&str> {
         self.messages
             .iter()
@@ -80,9 +72,6 @@ mod tests {
 
     const XCC3_JOB: &str = "/redfish/v1/JobService/Jobs/FW_Update_1";
 
-    /// Task 5 of a Lenovo SR680a V4 XCC3 (IHX426W 1.94) after a multipart XCC
-    /// push, as the BMC served it: `Completed` six seconds after the upload,
-    /// while `FW_Update_1` still had the image to write.
     const XCC3_TASK: &str = r##"{
       "@odata.context": "/redfish/v1/$metadata#Task.Task",
       "@odata.etag": "W/\"1495A231\"",
@@ -130,7 +119,6 @@ mod tests {
                 &[XCC3_JOB][..],
                 Some(XCC3_JOB),
             ),
-            // No URI to follow: keep the Task's own state.
             ("Update.1.0.1.OperationTransitionedToJob", &[][..], None),
             ("Update.1.0.1.UpdateSuccessful", &[XCC3_JOB][..], None),
             ("Base.1.0.OperationTransitionedToJob", &[XCC3_JOB][..], None),
