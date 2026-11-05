@@ -810,6 +810,20 @@ class RfMockupServer(BaseHTTPRequestHandler):
 
         if data_received is not None:
             logger.info("   POST: Data: {}".format(data_received))
+
+            # Serve a canned post_response.json as for PATCH. If the file has a
+            # top-level `match_request_body`, serve it only when the request's
+            # JSON body equals that value. Lets vendor mockups model actions
+            # that a BMC serves without advertising them.
+            post_response_fpath = self.construct_path(self.path, "post_response.json")
+            if os.path.isfile(post_response_fpath):
+                with open(post_response_fpath) as f:
+                    canned = json.load(f)
+                expected = canned.get("match_request_body")
+                if expected is None or data_received == expected:
+                    self.send_response_file(post_response_fpath)
+                    return
+
             # construct path "mockdir/path/to/resource/<filename>"
             fpath = self.construct_path(self.path, "index.json")
             success, payload = self.get_cached_link(fpath)
