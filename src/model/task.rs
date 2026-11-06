@@ -42,3 +42,96 @@ impl std::fmt::Display for TaskState {
         std::fmt::Debug::fmt(self, f)
     }
 }
+
+impl Task {
+    pub fn transitioned_job_uri(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .find(|m| is_operation_transitioned_to_job(&m.message_id))
+            .and_then(|m| m.message_args.first())
+            .map(String::as_str)
+    }
+}
+
+fn is_operation_transitioned_to_job(message_id: &str) -> bool {
+    let mut parts = message_id.split('.');
+    let (Some("Update"), Some("OperationTransitionedToJob")) = (parts.next(), parts.next_back())
+    else {
+        return false;
+    };
+    let version: Vec<&str> = parts.collect();
+    matches!(version.len(), 2 | 3)
+        && version
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const XCC3_JOB: &str = "/redfish/v1/JobService/Jobs/FW_Update_1";
+
+    const XCC3_TASK: &str = r##"{
+      "@odata.context": "/redfish/v1/$metadata#Task.Task",
+      "@odata.etag": "W/\"1495A231\"",
+      "@odata.id": "/redfish/v1/TaskService/Tasks/5",
+      "@odata.type": "#Task.v1_7_4.Task",
+      "Description": "This resource represents a task for a Redfish implementation.",
+      "EndTime": "2026-11-04T22:00:27+00:00",
+      "HidePayload": true,
+      "Id": "5",
+      "Messages": [
+        {
+          "@odata.type": "#Message.v1_1_1.Message",
+          "Message": "The update operation has transitioned to the job at URI '/redfish/v1/JobService/Jobs/FW_Update_1'.",
+          "MessageArgs": ["/redfish/v1/JobService/Jobs/FW_Update_1"],
+          "MessageId": "Update.1.0.1.OperationTransitionedToJob",
+          "MessageSeverity": "OK",
+          "Resolution": "Follow the referenced job and monitor the job for further updates."
+        }
+      ],
+      "Name": "Task 5",
+      "PercentComplete": 100,
+      "StartTime": "2026-11-04T22:00:21+00:00",
+      "TaskMonitor": "/redfish/v1/TaskService/TaskMonitors/5",
+      "TaskState": "Completed",
+      "TaskStatus": "OK"
+    }"##;
+
+    #[test]
+    fn xcc3_task_follows_its_job() {
+        let task: Task = serde_json::from_str(XCC3_TASK).unwrap();
+        assert_eq!(task.transitioned_job_uri(), Some(XCC3_JOB));
+    }
+
+    #[test]
+    fn transitioned_job_uri_by_message_id() {
+        let mut task: Task = serde_json::from_str(XCC3_TASK).unwrap();
+        for (message_id, args, expected) in [
+            (
+                "Update.1.0.OperationTransitionedToJob",
+                &[XCC3_JOB][..],
+                Some(XCC3_JOB),
+            ),
+            (
+                "Update.1.2.OperationTransitionedToJob",
+                &[XCC3_JOB][..],
+                Some(XCC3_JOB),
+            ),
+            ("Update.1.0.1.OperationTransitionedToJob", &[][..], None),
+            ("Update.1.0.1.UpdateSuccessful", &[XCC3_JOB][..], None),
+            ("Base.1.0.OperationTransitionedToJob", &[XCC3_JOB][..], None),
+            ("Update.OperationTransitionedToJob", &[XCC3_JOB][..], None),
+            (
+                "Update.1.x.OperationTransitionedToJob",
+                &[XCC3_JOB][..],
+                None,
+            ),
+        ] {
+            task.messages[0].message_id = message_id.to_string();
+            task.messages[0].message_args = args.iter().map(|a| a.to_string()).collect();
+            assert_eq!(task.transitioned_job_uri(), expected, "{message_id}");
+        }
+    }
+}

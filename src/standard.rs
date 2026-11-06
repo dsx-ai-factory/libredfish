@@ -608,23 +608,17 @@ impl Redfish for RedfishStandard {
             let url = format!("TaskService/Tasks/{}", id);
             let (_status_code, body) = self.client.get::<Task>(&url).await?;
 
-            if let Some(msg) = body
-                .messages
-                .iter()
-                .find(|x| x.message_id == "Update.1.0.OperationTransitionedToJob")
-            {
-                if let Some(message_arg) = msg.message_args.first() {
-                    // The task is redirecting us to a JobService.  Look at that instead, and make a fake task from it.
-                    let (_, job): (_, Job) = self
-                        .client
-                        .get(
-                            message_arg
-                                .strip_prefix("/redfish/v1/")
-                                .unwrap_or("wrong_prefix"),
-                        )
-                        .await?;
-                    return Ok(job.as_task());
-                }
+            if let Some(job_uri) = body.transitioned_job_uri() {
+                // The task is redirecting us to a JobService.  Look at that instead, and make a fake task from it.
+                let (_, job): (_, Job) = self
+                    .client
+                    .get(
+                        job_uri
+                            .strip_prefix("/redfish/v1/")
+                            .unwrap_or("wrong_prefix"),
+                    )
+                    .await?;
+                return Ok(job.as_task());
             }
             Ok(body)
         })
