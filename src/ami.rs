@@ -196,7 +196,7 @@ impl Bmc {
         Ok(lockdown_status_from(message, is_locked, is_unlocked))
     }
 
-    /// LenovoAMI-specific lockdown status via OEM ConfigBMC endpoint.
+    /// LenovoAMI lockdown status includes OEM ConfigBMC and the host interface.
     async fn lockdown_status_lenovo_ami(&self) -> Result<Status, RedfishError> {
         const LOCKDOWN_FIELDS: &[&str] = &[
             "LockoutHostControl",
@@ -220,8 +220,14 @@ impl Bmc {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let is_locked = values.iter().all(|&v| v == "Enable");
-        let is_unlocked = values.iter().all(|&v| v == "Disable");
+        let hi_url = format!("Managers/{}/HostInterfaces/Self", self.s.manager_id());
+        let (_status, hi): (_, HashMap<String, serde_json::Value>) =
+            self.s.client.get(&hi_url).await?;
+        let hi_enabled = jsonmap::get_bool(&hi, "InterfaceEnabled", &hi_url)?;
+        let message = format!("{message}, host_interface={hi_enabled}");
+
+        let is_locked = values.iter().all(|&v| v == "Enable") && !hi_enabled;
+        let is_unlocked = values.iter().all(|&v| v == "Disable") && hi_enabled;
 
         Ok(lockdown_status_from(message, is_locked, is_unlocked))
     }
@@ -380,7 +386,8 @@ impl Redfish for Bmc {
 
     /// AMI lockdown - controls KCS access, USB support, and Host Interface.
     /// On LenovoAMI, uses the OEM ConfigBMC endpoint to control host lockout,
-    /// BIOS variable write, BIOS settings change, and BIOS upgrade/downgrade.
+    /// BIOS variable write, BIOS settings change, and BIOS upgrade/downgrade,
+    /// together with the host interface.
     fn lockdown<'a>(
         &'a self,
         target: EnabledDisabled,
@@ -399,7 +406,8 @@ impl Redfish for Bmc {
                     ("LockdownBiosUpgradeDowngrade", value),
                 ]);
                 let config_bmc_url = format!("Managers/{}/Oem/ConfigBMC", self.s.manager_id());
-                return self.s.client.post(&config_bmc_url, body).await.map(|_| ());
+                self.s.client.post(&config_bmc_url, body).await?;
+                return self.lockdown_bmc(target).await;
             }
 
             // LenovoGB300 has neither the OEM ConfigBMC endpoint nor
@@ -431,7 +439,7 @@ impl Redfish for Bmc {
     }
 
     /// AMI lockdown status - checks KCS access, USB support, and Host Interface.
-    /// On LenovoAMI, reads the OEM ConfigBMC endpoint instead. On LenovoGB300,
+    /// On LenovoAMI, reads OEM ConfigBMC and the host interface. On LenovoGB300,
     /// checks USB support and the host interface (no KCS/ConfigBMC there).
     fn lockdown_status<'a>(&'a self) -> crate::RedfishFuture<'a, Result<Status, RedfishError>> {
         Box::pin(async move {
@@ -816,7 +824,8 @@ impl Redfish for Bmc {
         })
     }
 
-    /// AMI lockdown_bmc - BMC-only lockdown (Host Interface only)
+    /// AMI BMC-only lockdown controls the host interface. LenovoAMI full
+    /// lockdown also uses this operation after updating ConfigBMC.
     fn lockdown_bmc<'a>(
         &'a self,
         target: EnabledDisabled,

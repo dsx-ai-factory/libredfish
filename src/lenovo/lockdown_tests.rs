@@ -99,6 +99,12 @@ async fn client(script: Vec<Request>) -> (Bmc, Server) {
                 first,
                 format!("{} /redfish/v1/{} HTTP/1.1", expected.method, expected.path)
             );
+            if expected.method == "PATCH" && expected.path == AMI_HOST_INTERFACE {
+                assert!(header.lines().any(|line| line
+                    .split_once(':')
+                    .is_some_and(|(name, value)| name.eq_ignore_ascii_case("if-match")
+                        && value.trim() == "*")));
+            }
             let length = header
                 .lines()
                 .find_map(|line| {
@@ -457,5 +463,136 @@ async fn absent_optional_resources_are_skipped_but_bios_http_errors_propagate() 
     security.status = 404;
     let (bmc, server) = client(vec![security, get(BIOS, json!({}))]).await;
     bmc.lockdown_bmc(EnabledDisabled::Disabled).await.unwrap();
+    server.finish().await;
+}
+
+const AMI_CONFIG: &str = "Managers/1/Oem/ConfigBMC";
+const AMI_HOST_INTERFACE: &str = "Managers/1/HostInterfaces/Self";
+
+fn ami_config(value: &str) -> Value {
+    json!({
+        "LockoutHostControl": value,
+        "LockoutBiosVariableWriteMode": value,
+        "LockdownBiosSettingsChange": value,
+        "LockdownBiosUpgradeDowngrade": value,
+    })
+}
+
+async fn ami_client(script: Vec<Request>) -> (crate::ami::Bmc, Server) {
+    let (bmc, server) = client(script).await;
+    let mut standard = bmc.s;
+    standard.vendor = Some(crate::model::service_root::RedfishVendor::LenovoAMI);
+    (crate::ami::Bmc::new(standard).unwrap(), server)
+}
+
+#[tokio::test]
+async fn lenovo_ami_full_lockdown_updates_the_host_interface_in_both_directions() {
+    for target in [EnabledDisabled::Enabled, EnabledDisabled::Disabled] {
+        let enabled = target == EnabledDisabled::Enabled;
+        let config = ami_config(if enabled { "Enable" } else { "Disable" });
+        let script = vec![
+            Request {
+                method: "POST",
+                path: AMI_CONFIG,
+                body: Some(config),
+                status: 204,
+                response: Value::Null,
+            },
+            patch(AMI_HOST_INTERFACE, json!({"InterfaceEnabled": !enabled})),
+        ];
+        let (bmc, server) = ami_client(script).await;
+        bmc.lockdown(target).await.unwrap();
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn lenovo_ami_lockdown_status_requires_consistent_config_and_host_interface() {
+    for (config, host_interface, expected) in [
+        (ami_config("Enable"), false, StatusInternal::Enabled),
+        (ami_config("Disable"), true, StatusInternal::Disabled),
+        (ami_config("Disable"), false, StatusInternal::Partial),
+        (ami_config("Enable"), true, StatusInternal::Partial),
+        (
+            json!({"LockoutHostControl": "Disable"}),
+            true,
+            StatusInternal::Partial,
+        ),
+    ] {
+        let (bmc, server) = ami_client(vec![
+            get(AMI_CONFIG, config),
+            get(
+                AMI_HOST_INTERFACE,
+                json!({"InterfaceEnabled": host_interface}),
+            ),
+        ])
+        .await;
+        assert_eq!(bmc.lockdown_status().await.unwrap().status, expected);
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn lenovo_ami_lockdown_propagates_config_and_host_interface_failures() {
+    for failed_write in [0, 1] {
+        let mut script = vec![
+            Request {
+                method: "POST",
+                path: AMI_CONFIG,
+                body: Some(ami_config("Disable")),
+                status: 204,
+                response: Value::Null,
+            },
+            patch(AMI_HOST_INTERFACE, json!({"InterfaceEnabled": true})),
+        ];
+        script[failed_write].status = 503;
+        script.truncate(failed_write + 1);
+        let (bmc, server) = ami_client(script).await;
+        assert!(bmc.lockdown(EnabledDisabled::Disabled).await.is_err());
+        server.finish().await;
+    }
+    for response in [json!({}), json!({"InterfaceEnabled": "true"})] {
+        let (bmc, server) = ami_client(vec![
+            get(AMI_CONFIG, ami_config("Disable")),
+            get(AMI_HOST_INTERFACE, response),
+        ])
+        .await;
+        assert!(bmc.lockdown_status().await.is_err());
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn lenovo_ami_missing_host_interface_is_not_reported_as_unlocked() {
+    let mut missing_interface = get(AMI_HOST_INTERFACE, json!({}));
+    missing_interface.status = 404;
+    let (bmc, server) = ami_client(vec![
+        get(AMI_CONFIG, ami_config("Disable")),
+        missing_interface,
+    ])
+    .await;
+    assert!(matches!(
+        bmc.lockdown_status().await,
+        Err(RedfishError::HTTPErrorCode { status_code, .. }) if status_code.as_u16() == 404
+    ));
+    server.finish().await;
+
+    let mut missing_interface = patch(AMI_HOST_INTERFACE, json!({"InterfaceEnabled": true}));
+    missing_interface.status = 404;
+    let (bmc, server) = ami_client(vec![
+        Request {
+            method: "POST",
+            path: AMI_CONFIG,
+            body: Some(ami_config("Disable")),
+            status: 204,
+            response: Value::Null,
+        },
+        missing_interface,
+    ])
+    .await;
+    assert!(matches!(
+        bmc.lockdown(EnabledDisabled::Disabled).await,
+        Err(RedfishError::HTTPErrorCode { status_code, .. }) if status_code.as_u16() == 404
+    ));
     server.finish().await;
 }
