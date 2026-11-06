@@ -99,6 +99,12 @@ async fn client(script: Vec<Request>) -> (Bmc, Server) {
                 first,
                 format!("{} /redfish/v1/{} HTTP/1.1", expected.method, expected.path)
             );
+            if expected.method == "PATCH" && expected.path == AMI_HOST_INTERFACE {
+                assert!(header.lines().any(|line| line
+                    .split_once(':')
+                    .is_some_and(|(name, value)| name.eq_ignore_ascii_case("if-match")
+                        && value.trim() == "*")));
+            }
             let length = header
                 .lines()
                 .find_map(|line| {
@@ -554,4 +560,39 @@ async fn lenovo_ami_lockdown_propagates_config_and_host_interface_failures() {
         assert!(bmc.lockdown_status().await.is_err());
         server.finish().await;
     }
+}
+
+#[tokio::test]
+async fn lenovo_ami_missing_host_interface_is_not_reported_as_unlocked() {
+    let mut missing_interface = get(AMI_HOST_INTERFACE, json!({}));
+    missing_interface.status = 404;
+    let (bmc, server) = ami_client(vec![
+        get(AMI_CONFIG, ami_config("Disable")),
+        missing_interface,
+    ])
+    .await;
+    assert!(matches!(
+        bmc.lockdown_status().await,
+        Err(RedfishError::HTTPErrorCode { status_code, .. }) if status_code.as_u16() == 404
+    ));
+    server.finish().await;
+
+    let mut missing_interface = patch(AMI_HOST_INTERFACE, json!({"InterfaceEnabled": true}));
+    missing_interface.status = 404;
+    let (bmc, server) = ami_client(vec![
+        Request {
+            method: "POST",
+            path: AMI_CONFIG,
+            body: Some(ami_config("Disable")),
+            status: 204,
+            response: Value::Null,
+        },
+        missing_interface,
+    ])
+    .await;
+    assert!(matches!(
+        bmc.lockdown(EnabledDisabled::Disabled).await,
+        Err(RedfishError::HTTPErrorCode { status_code, .. }) if status_code.as_u16() == 404
+    ));
+    server.finish().await;
 }

@@ -824,7 +824,8 @@ impl Redfish for Bmc {
         })
     }
 
-    /// AMI lockdown_bmc - BMC-only lockdown (Host Interface only)
+    /// AMI BMC-only lockdown controls the host interface. LenovoAMI full
+    /// lockdown also uses this operation after updating ConfigBMC.
     fn lockdown_bmc<'a>(
         &'a self,
         target: EnabledDisabled,
