@@ -1474,6 +1474,7 @@ impl Bmc {
         self.change_boot_order(boot_array).await
     }
 
+    /// First option in pending order.
     async fn get_pending_first_boot_option(&self) -> Option<String> {
         let url = format!("Systems/{}/Pending", self.s.system_id());
         let pending: Result<(_, ComputerSystem), _> = self.s.client.get(&url).await;

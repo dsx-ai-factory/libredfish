@@ -108,6 +108,7 @@ async fn test_lenovo() -> Result<(), anyhow::Error> {
     run_integration_test("lenovo", LENOVO_PORT).await
 }
 
+/// Skips PATCH when already first.
 #[tokio::test]
 async fn test_lenovo_boot_first_skips_pending_order_that_already_matches() -> anyhow::Result<()> {
     let _server = run_mockup_server_with_args("lenovo", LENOVO_SLOW_PENDING_PATCH_PORT, &["-T"])?;
@@ -370,6 +371,7 @@ fn run_mockup_server(vendor_dir: &'static str, port: &'static str) -> anyhow::Re
     run_mockup_server_with_args(vendor_dir, port, &[])
 }
 
+/// Starts mockup server with flags.
 fn run_mockup_server_with_args(
     vendor_dir: &'static str,
     port: &'static str,
