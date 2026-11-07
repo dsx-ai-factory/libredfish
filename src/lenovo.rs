@@ -1466,7 +1466,7 @@ impl Bmc {
             Some(b) => b,
         };
 
-        if self.get_pending_boot_order().await.as_deref() == Some(boot_array.as_slice()) {
+        if self.get_pending_first_boot_option().await.as_ref() == boot_array.first() {
             tracing::info!("NO-OP: {name} is already the first pending boot option");
             return Ok(());
         }
@@ -1474,11 +1474,11 @@ impl Bmc {
         self.change_boot_order(boot_array).await
     }
 
-    async fn get_pending_boot_order(&self) -> Option<Vec<String>> {
+    async fn get_pending_first_boot_option(&self) -> Option<String> {
         let url = format!("Systems/{}/Pending", self.s.system_id());
         let pending: Result<(_, ComputerSystem), _> = self.s.client.get(&url).await;
         match pending {
-            Ok((_status_code, pending)) => Some(pending.boot.boot_order),
+            Ok((_status_code, pending)) => pending.boot.boot_order.into_iter().next(),
             Err(e) => {
                 tracing::warn!("could not read the pending boot order, sending the change: {e}");
                 None
