@@ -198,7 +198,8 @@ pub trait Redfish: Send + Sync + 'static {
         <standard::RedfishStandard as Redfish>::cancel_task(self.std_redfish(), id)
     }
 
-    /// Is this thing even on?
+    /// Returns the reported host power state.
+    /// Missing or null PowerState and invalid values return an error.
     fn get_power_state<'a>(&'a self) -> RedfishFuture<'a, Result<PowerState, RedfishError>> {
         <standard::RedfishStandard as Redfish>::get_power_state(self.std_redfish())
     }
@@ -1511,3 +1512,6 @@ mod tests {
         assert!(err.to_string().contains("NIC.Slot.7-1-1"));
     }
 }
+
+#[cfg(test)]
+mod power_state_tests;
