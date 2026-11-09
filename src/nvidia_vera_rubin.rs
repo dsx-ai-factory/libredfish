@@ -54,6 +54,9 @@ use crate::{MachineSetupDiff, MachineSetupStatus};
 
 const UEFI_PASSWORD_NAME: &str = "AdminPassword";
 
+/// Number of CX NICs on a Vera Rubin Astra tray. Valid NIC indices are `0..VR_ASTRA_NIC_COUNT`.
+const VR_ASTRA_NIC_COUNT: u8 = 8;
+
 pub struct Bmc {
     s: RedfishStandard,
 }
@@ -988,9 +991,11 @@ impl Redfish for Bmc {
         nic_index: u8,
     ) -> crate::RedfishFuture<'a, Result<Option<bool>, RedfishError>> {
         Box::pin(async move {
-            if nic_index >= 8 {
+            if nic_index >= VR_ASTRA_NIC_COUNT {
                 return Err(RedfishError::GenericError {
-                    error: format!("nic_index {nic_index} out of range; expected 0..8"),
+                    error: format!(
+                        "nic_index {nic_index} out of range; expected 0..{VR_ASTRA_NIC_COUNT}"
+                    ),
                 });
             }
             let url = format!("Chassis/CX_{nic_index}/NetworkAdapters/CX_NIC_{nic_index}/Settings");
@@ -1013,9 +1018,11 @@ impl Redfish for Bmc {
         enabled: bool,
     ) -> crate::RedfishFuture<'a, Result<(), RedfishError>> {
         Box::pin(async move {
-            if nic_index >= 8 {
+            if nic_index >= VR_ASTRA_NIC_COUNT {
                 return Err(RedfishError::GenericError {
-                    error: format!("nic_index {nic_index} out of range; expected 0..8"),
+                    error: format!(
+                        "nic_index {nic_index} out of range; expected 0..{VR_ASTRA_NIC_COUNT}"
+                    ),
                 });
             }
             let body = serde_json::json!({
@@ -1037,17 +1044,17 @@ impl Redfish for Bmc {
         nic_index: u8,
     ) -> crate::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
         // Given the nic index, we have to translate it into cage and MPO numbers.
-        // Cage number is ((nic_index / 2) * 2) + 1
-        // MPO number is (nic_index % 2) + 1
         // Then the Redfish path for getting the MAC is /redfish/v1/Systems/System_0/EthernetInterfaces/NIC_0_C<cage>_<mpo>
         Box::pin(async move {
-            if nic_index >= 8 {
+            if nic_index >= VR_ASTRA_NIC_COUNT {
                 return Err(RedfishError::GenericError {
-                    error: format!("nic_index {nic_index} out of range; expected 0..8"),
+                    error: format!(
+                        "nic_index {nic_index} out of range; expected 0..{VR_ASTRA_NIC_COUNT}"
+                    ),
                 });
             }
-            let cage = ((nic_index / 2) * 2) + 1;
-            let mpo = (nic_index % 2) + 1;
+            let cage = Self::astra_get_cage_index(nic_index);
+            let mpo = Self::astra_get_mpo_index(nic_index);
             let url = format!(
                 "Systems/{}/EthernetInterfaces/NIC_0_C{cage}_{mpo}",
                 self.s.system_id()
@@ -1068,9 +1075,11 @@ impl Redfish for Bmc {
         nic_index: u8,
     ) -> crate::RedfishFuture<'a, Result<Option<crate::SpxNicModelAndName>, RedfishError>> {
         Box::pin(async move {
-            if nic_index >= 8 {
+            if nic_index >= VR_ASTRA_NIC_COUNT {
                 return Err(RedfishError::GenericError {
-                    error: format!("nic_index {nic_index} out of range; expected 0..8"),
+                    error: format!(
+                        "nic_index {nic_index} out of range; expected 0..{VR_ASTRA_NIC_COUNT}"
+                    ),
                 });
             }
             let chassis_id = format!("CX_{nic_index}");
@@ -1089,6 +1098,35 @@ impl Redfish for Bmc {
 }
 
 impl Bmc {
+    /// Return the cage index for a NIC index in Astra.
+    ///
+    /// This is the table for CX9 label to MPO label mapping.
+    ///      CX9 label   MPO label
+    ///      CX-0        C1-1
+    ///      CX-1        C1-2
+    ///      CX-2        C3-1
+    ///      CX-3        C3-2
+    ///      CX-4        C7-1
+    ///      CX-5        C7-2
+    ///      CX-6        C5-1
+    ///      CX-7        C5-2
+    pub fn astra_get_cage_index(nic_index: u8) -> u8 {
+        match nic_index / 2 {
+            0 => 1,
+            1 => 3,
+            2 => 7,
+            3 => 5,
+            _ => panic!("invalid NIC index {nic_index}"), // or return Option/Result
+        }
+    }
+
+    /// Return the MPO index for a NIC index in Astra.
+    ///
+    /// MPO index is `(nic_index % 2) + 1`.
+    pub fn astra_get_mpo_index(nic_index: u8) -> u8 {
+        (nic_index % 2) + 1
+    }
+
     /// Check BIOS and BMC attributes and return differences
     async fn diff_bios_bmc_attr(&self) -> Result<Vec<MachineSetupDiff>, RedfishError> {
         let mut diffs = vec![];
