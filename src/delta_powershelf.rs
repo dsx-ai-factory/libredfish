@@ -1,6 +1,7 @@
 use crate::Assembly;
 use std::collections::HashMap;
 
+use crate::model::account_service::ManagerAccount;
 use crate::model::boot::BootOverride;
 use crate::model::certificate::Certificate;
 use crate::model::component_integrity::ComponentIntegrities;
@@ -33,6 +34,21 @@ impl Redfish for Bmc {
     fn std_redfish(&self) -> &RedfishStandard {
         &self.s
     }
+    fn get_accounts<'a>(
+        &'a self,
+    ) -> crate::RedfishFuture<'a, Result<Vec<ManagerAccount>, RedfishError>> {
+        Box::pin(async move {
+            // Delta advertises expansion support but expanded account reads return HTTP 500.
+            let account_ids = self.s.get_members("AccountService/Accounts").await?;
+            let mut accounts = Vec::with_capacity(account_ids.len());
+            for id in account_ids {
+                accounts.push(self.s.get_account_by_id(&id).await?);
+            }
+            accounts.sort();
+            Ok(accounts)
+        })
+    }
+
     fn get_power_state<'a>(
         &'a self,
     ) -> crate::RedfishFuture<'a, Result<crate::PowerState, RedfishError>> {
