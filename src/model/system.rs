@@ -188,8 +188,7 @@ pub struct ComputerSystem {
     pub oem: Option<SystemExtensions>,
     // Dell: String. Lenovo: null
     pub part_number: Option<String>,
-    #[serde(default)]
-    pub power_state: PowerState,
+    pub power_state: Option<PowerState>,
     pub processor_summary: Option<SystemProcessors>,
     #[serde(rename = "SKU")]
     pub sku: Option<String>,
@@ -378,7 +377,7 @@ mod test {
     fn test_system_dell() {
         let data = include_str!("testdata/system_dell.json");
         let result: super::ComputerSystem = serde_json::from_str(data).unwrap();
-        assert_eq!(result.power_state, crate::PowerState::On);
+        assert_eq!(result.power_state, Some(crate::PowerState::On));
         assert_eq!(result.processor_summary.unwrap().count, Some(2));
         assert_eq!(result.part_number.as_deref(), Some("0H28RRA06"));
     }

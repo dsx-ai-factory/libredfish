@@ -217,7 +217,7 @@ impl Redfish for Bmc {
                 manufacturer: chassis.manufacturer,
                 model: chassis.model,
                 serial_number: chassis.serial_number,
-                power_state,
+                power_state: Some(power_state),
                 ..Default::default()
             })
         })

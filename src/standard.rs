@@ -207,7 +207,10 @@ impl Redfish for RedfishStandard {
     fn get_power_state<'a>(&'a self) -> crate::RedfishFuture<'a, Result<PowerState, RedfishError>> {
         Box::pin(async move {
             let system = self.get_system().await?;
-            Ok(system.power_state)
+            system.power_state.ok_or_else(|| RedfishError::MissingKey {
+                key: "PowerState".to_string(),
+                url: format!("Systems/{}/", self.system_id()),
+            })
         })
     }
 

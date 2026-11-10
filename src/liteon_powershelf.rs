@@ -41,7 +41,10 @@ impl Redfish for Bmc {
     ) -> crate::RedfishFuture<'a, Result<crate::PowerState, RedfishError>> {
         Box::pin(async move {
             let system = self.get_system().await?;
-            Ok(system.power_state)
+            system.power_state.ok_or_else(|| RedfishError::MissingKey {
+                key: "PowerState".to_string(),
+                url: format!("Systems/{}/", self.s.system_id()),
+            })
         })
     }
 
@@ -269,7 +272,7 @@ impl Redfish for Bmc {
         Box::pin(async move {
             let mut system = self.s.get_system().await?;
             let power = self.get_power_metrics().await;
-            system.power_state = power_state_from_psus(&power);
+            system.power_state = Some(power_state_from_psus(&power));
             Ok(system)
         })
     }
