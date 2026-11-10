@@ -1237,6 +1237,14 @@ impl Status {
             message: "Fake".to_string(),
         }
     }
+
+    /// Construct a partially applied status for test environments.
+    pub fn build_fake_partial() -> Self {
+        Self {
+            status: StatusInternal::Partial,
+            message: "Fake".to_string(),
+        }
+    }
 }
 
 /// How a caller identifies a boot interface to [`Redfish::machine_setup`]
