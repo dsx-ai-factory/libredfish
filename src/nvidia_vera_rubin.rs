@@ -1053,7 +1053,7 @@ impl Redfish for Bmc {
                     ),
                 });
             }
-            let cage = Self::astra_get_cage_index(nic_index);
+            let cage = Self::astra_get_cage_index(nic_index)?;
             let mpo = Self::astra_get_mpo_index(nic_index);
             let url = format!(
                 "Systems/{}/EthernetInterfaces/NIC_0_C{cage}_{mpo}",
@@ -1110,13 +1110,17 @@ impl Bmc {
     ///      CX-5        C7-2
     ///      CX-6        C5-1
     ///      CX-7        C5-2
-    pub fn astra_get_cage_index(nic_index: u8) -> u8 {
+    pub fn astra_get_cage_index(nic_index: u8) -> Result<u8, RedfishError> {
         match nic_index / 2 {
-            0 => 1,
-            1 => 3,
-            2 => 7,
-            3 => 5,
-            _ => panic!("invalid NIC index {nic_index}"), // or return Option/Result
+            0 => Ok(1),
+            1 => Ok(3),
+            2 => Ok(7),
+            3 => Ok(5),
+            _ => Err(RedfishError::GenericError {
+                error: format!(
+                    "nic_index {nic_index} out of range; expected 0..{VR_ASTRA_NIC_COUNT}"
+                ),
+            }),
         }
     }
 
