@@ -162,7 +162,10 @@ impl RedfishClientPoolBuilder {
             .map_err(|e| RedfishError::GenericError {
                 error: format!("Failed to build RedfishClientPool HTTP client: {}", e),
             })?;
-        let pool = RedfishClientPool { http_client };
+        let pool = RedfishClientPool {
+            http_client,
+            retry_mutations: true,
+        };
 
         Ok(pool)
     }
@@ -210,9 +213,27 @@ impl Default for Endpoint {
 #[derive(Debug, Clone)]
 pub struct RedfishClientPool {
     http_client: HttpClient,
+    retry_mutations: bool,
 }
 
 impl RedfishClientPool {
+    /// Returns a view that disables libredfish's network-error retry for non-GET requests.
+    ///
+    /// Use when a failed mutation may already have reached the BMC. The view
+    /// shares the existing HTTP client and connection pool; the original pool
+    /// and clients already created from it retain their policy. GET retries and
+    /// timeout/file error handling are unchanged. Vendor operations can still
+    /// intentionally issue several requests, and reqwest's own retry behavior
+    /// is unchanged. Connection and TLS failures also return without this retry.
+    /// The original [`RedfishError::NetworkError`] is returned for the caller to reconcile.
+    #[must_use = "create clients from the returned pool to disable mutation retries"]
+    pub fn without_mutation_retries(&self) -> Self {
+        Self {
+            http_client: self.http_client.clone(),
+            retry_mutations: false,
+        }
+    }
+
     /// Returns Builder for configuring a Redfish HTTP connection pool
     pub fn builder() -> RedfishClientPoolBuilder {
         RedfishClientPoolBuilder {
@@ -284,7 +305,8 @@ impl RedfishClientPool {
         vendor: Option<RedfishVendor>,
         custom_headers: Vec<(HeaderName, String)>,
     ) -> Result<Box<dyn crate::Redfish>, RedfishError> {
-        let client = RedfishHttpClient::new(self.http_client.clone(), endpoint, custom_headers);
+        let mut client = RedfishHttpClient::new(self.http_client.clone(), endpoint, custom_headers);
+        client.retry_mutations = self.retry_mutations;
         let mut s = RedfishStandard::new(client);
         let service_root = s.get_service_root().await?;
 
@@ -434,7 +456,8 @@ impl RedfishClientPool {
         endpoint: Endpoint,
         custom_headers: Vec<(HeaderName, String)>,
     ) -> Result<Box<RedfishStandard>, RedfishError> {
-        let client = RedfishHttpClient::new(self.http_client.clone(), endpoint, custom_headers);
+        let mut client = RedfishHttpClient::new(self.http_client.clone(), endpoint, custom_headers);
+        client.retry_mutations = self.retry_mutations;
         let s = RedfishStandard::new(client);
         Ok(Box::new(s))
     }
@@ -472,6 +495,7 @@ pub struct RedfishHttpClient {
     endpoint: Endpoint,
     http_client: HttpClient,
     custom_headers: Vec<(HeaderName, String)>,
+    retry_mutations: bool,
 }
 
 impl RedfishHttpClient {
@@ -484,6 +508,7 @@ impl RedfishHttpClient {
             endpoint,
             http_client,
             custom_headers,
+            retry_mutations: true,
         }
     }
 
@@ -687,7 +712,9 @@ impl RedfishHttpClient {
                 // Avoid doubling of timeouts. It is specifically important if caller relies on
                 // timing of this call.
                 Err(RedfishError::NetworkError { source, url }) => {
-                    if source.is_timeout() {
+                    // A failed response can follow an applied mutation; let the
+                    // caller reconcile before deciding whether to send it again.
+                    if source.is_timeout() || (!self.retry_mutations && method != Method::GET) {
                         Err(RedfishError::NetworkError { source, url })
                     } else {
                         // HPE sends RST in case same connection is reused. To avoid that let's retry.
