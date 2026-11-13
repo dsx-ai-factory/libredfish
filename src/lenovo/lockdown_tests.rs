@@ -18,15 +18,15 @@ const SECURITY: &str = "Managers/1/Oem/Lenovo/Security";
 const BIOS: &str = "Systems/1/Bios";
 
 #[derive(Clone)]
-struct Request {
-    method: &'static str,
-    path: &'static str,
-    body: Option<Value>,
-    status: u16,
-    response: Value,
+pub(super) struct Request {
+    pub(super) method: &'static str,
+    pub(super) path: &'static str,
+    pub(super) body: Option<Value>,
+    pub(super) status: u16,
+    pub(super) response: Value,
 }
 
-fn get(path: &'static str, response: Value) -> Request {
+pub(super) fn get(path: &'static str, response: Value) -> Request {
     Request {
         method: "GET",
         path,
@@ -36,7 +36,7 @@ fn get(path: &'static str, response: Value) -> Request {
     }
 }
 
-fn patch(path: &'static str, body: Value) -> Request {
+pub(super) fn patch(path: &'static str, body: Value) -> Request {
     Request {
         method: "PATCH",
         path,
@@ -48,10 +48,10 @@ fn patch(path: &'static str, body: Value) -> Request {
 
 // A scripted TLS peer verifies the real Redfish client's HTTP paths, payloads,
 // ordering, and error propagation, without accepting writes to unknown controls.
-struct Server(JoinHandle<()>);
+pub(super) struct Server(JoinHandle<()>);
 
 impl Server {
-    async fn finish(mut self) {
+    pub(super) async fn finish(mut self) {
         tokio::time::timeout(Duration::from_secs(5), &mut self.0)
             .await
             .expect("all expected requests must arrive")
@@ -65,7 +65,7 @@ impl Drop for Server {
     }
 }
 
-async fn client(script: Vec<Request>) -> (Bmc, Server) {
+pub(super) async fn client(script: Vec<Request>) -> (Bmc, Server) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let cert = CertificateDer::from_pem_slice(include_bytes!("../../tests/cert.pem")).unwrap();
