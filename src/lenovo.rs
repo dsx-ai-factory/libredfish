@@ -46,7 +46,7 @@ use crate::{
         oem::lenovo,
         sel::{LogEntry, LogEntryCollection},
         software_inventory::SoftwareInventory,
-        BootOption,
+        BootOption, ComputerSystem,
     },
     network::REDFISH_ENDPOINT,
     standard::RedfishStandard,
@@ -1466,7 +1466,25 @@ impl Bmc {
             Some(b) => b,
         };
 
+        if self.get_pending_first_boot_option().await.as_ref() == boot_array.first() {
+            tracing::info!("NO-OP: {name} is already the first pending boot option");
+            return Ok(());
+        }
+
         self.change_boot_order(boot_array).await
+    }
+
+    /// First option in pending order.
+    async fn get_pending_first_boot_option(&self) -> Option<String> {
+        let url = format!("Systems/{}/Pending", self.s.system_id());
+        let pending: Result<(_, ComputerSystem), _> = self.s.client.get(&url).await;
+        match pending {
+            Ok((_status_code, pending)) => pending.boot.boot_order.into_iter().next(),
+            Err(e) => {
+                tracing::warn!("could not read the pending boot order, sending the change: {e}");
+                None
+            }
+        }
     }
 
     // A Vec of string boot option names, with the one you want first.

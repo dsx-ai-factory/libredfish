@@ -956,9 +956,8 @@ class RfMockupServer(BaseHTTPRequestHandler):
                         logger.info("Time in the json file, not a float/int value. Reading the default time.")
                         return self.server.responseTime
                     return float(d[time_str])
-        else:
-            logger.info(("response time:", self.server.responseTime))
-            return self.server.responseTime
+        logger.info(("response time:", self.server.responseTime))
+        return self.server.responseTime
 
 
 def main():
