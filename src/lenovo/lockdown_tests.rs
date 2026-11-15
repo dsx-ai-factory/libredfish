@@ -472,7 +472,6 @@ const AMI_HOST_INTERFACE: &str = "Managers/1/HostInterfaces/Self";
 fn ami_config(value: &str) -> Value {
     json!({
         "LockoutHostControl": value,
-        "LockoutBiosVariableWriteMode": value,
         "LockdownBiosSettingsChange": value,
         "LockdownBiosUpgradeDowngrade": value,
     })
@@ -508,9 +507,15 @@ async fn lenovo_ami_full_lockdown_updates_the_host_interface_in_both_directions(
 
 #[tokio::test]
 async fn lenovo_ami_lockdown_status_requires_consistent_config_and_host_interface() {
+    let mut variable_writes_locked = ami_config("Disable");
+    variable_writes_locked["LockoutBiosVariableWriteMode"] = json!("Enable");
+    let mut variable_writes_unlocked = ami_config("Enable");
+    variable_writes_unlocked["LockoutBiosVariableWriteMode"] = json!("Disable");
     for (config, host_interface, expected) in [
         (ami_config("Enable"), false, StatusInternal::Enabled),
         (ami_config("Disable"), true, StatusInternal::Disabled),
+        (variable_writes_locked, true, StatusInternal::Disabled),
+        (variable_writes_unlocked, false, StatusInternal::Enabled),
         (ami_config("Disable"), false, StatusInternal::Partial),
         (ami_config("Enable"), true, StatusInternal::Partial),
         (
