@@ -51,6 +51,10 @@ impl Job {
             task_status: None,
             task_monitor: None,
             percent_complete: self.percent_complete,
+            start_time: None,
+            end_time: None,
+            payload: None,
+            hide_payload: None,
         }
     }
 }

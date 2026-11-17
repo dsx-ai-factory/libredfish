@@ -1,0 +1,18 @@
+{
+  "@odata.id": "/redfish/v1/TaskService/Tasks/0",
+  "@odata.type": "#Task.v1_4_3.Task",
+  "EndTime": "2026-11-10T17:46:39+00:00",
+  "HidePayload": false,
+  "Id": "0",
+  "Name": "Task 0",
+  "Payload": {
+    "HttpOperation": "POST",
+    "JsonBody": "{\n  \"ImageURI\": \"http://firmware.example.com/images/dpu-os.bfb\",\n  \"Targets\": [\n    \"redfish/v1/UpdateService/FirmwareInventory/DPU_OS\"\n  ],\n  \"TransferProtocol\": \"HTTP\"\n}",
+    "TargetUri": "/redfish/v1/UpdateService/Actions/UpdateService.SimpleUpdate"
+  },
+  "PercentComplete": 100,
+  "StartTime": "2026-11-10T17:42:10+00:00",
+  "TaskMonitor": "/redfish/v1/TaskService/Tasks/0/Monitor",
+  "TaskState": "Completed",
+  "TaskStatus": "OK"
+}
