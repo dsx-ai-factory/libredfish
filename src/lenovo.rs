@@ -55,8 +55,9 @@ use crate::{
 };
 
 const UEFI_PASSWORD_NAME: &str = "UefiAdminPassword";
-const GENERAL_BOOT_ORDER_HARD_DISK: &str = "Hard Disk";
 
+#[cfg(test)]
+mod boot_order_tests;
 #[cfg(test)]
 mod lockdown_tests;
 
@@ -205,24 +206,24 @@ impl Redfish for Bmc {
         Box::pin(async move {
             self.setup_serial_console().await?;
             self.clear_tpm().await?;
+            let skip_boot_order_404 = |r| match r {
+                Err(RedfishError::HTTPErrorCode {
+                    status_code: StatusCode::NOT_FOUND,
+                    ..
+                }) => {
+                    tracing::info!("OEM BootOrder.BootOrder not found, skipping (newer firmware?)");
+                    Ok(())
+                }
+                r => r,
+            };
+            skip_boot_order_404(self.ensure_in_general_boot_order(Boot::Pxe).await)?;
             match self.boot_first(Boot::Pxe).await {
                 Ok(()) => {}
                 Err(RedfishError::MissingBootOption(_)) => {
                     tracing::info!(
                         "Network boot option not found, setting it via OEM general boot order"
                     );
-                    match self.set_general_boot_order_network_first().await {
-                        Ok(()) => {}
-                        Err(RedfishError::HTTPErrorCode {
-                            status_code: StatusCode::NOT_FOUND,
-                            ..
-                        }) => {
-                            tracing::info!(
-                                "OEM BootOrder.BootOrder not found, skipping (newer firmware)"
-                            );
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    skip_boot_order_404(self.set_general_boot_order_network_first().await)?;
                 }
                 Err(e) => return Err(e),
             }
@@ -778,7 +779,8 @@ impl Redfish for Bmc {
                 return Ok(false);
             }
 
-            self.is_general_boot_order_hard_disk_present().await
+            self.is_general_boot_order_option_present(Boot::HardDisk)
+                .await
         })
     }
 
@@ -802,7 +804,7 @@ impl Bmc {
     ) -> Result<Option<String>, RedfishError> {
         // Lenovo BMCs can drop Hard Disk from the general boot order, causing
         // instance creation to fail because the tenant OS cannot boot.
-        self.enable_hard_disk_in_general_boot_order().await?;
+        self.ensure_in_general_boot_order(Boot::HardDisk).await?;
 
         let mac = mac_address.to_string();
         // We see three patterns for HTTP IPv4 DPU boot option names in a Lenovo's network boot order:
@@ -1031,6 +1033,14 @@ impl Bmc {
                 key: "boot_first_type".to_string(),
                 expected: lenovo::BootOptionName::Network.to_string(),
                 actual: boot_first_name,
+            });
+        }
+
+        if !self.is_general_boot_order_option_present(Boot::Pxe).await? {
+            diffs.push(MachineSetupDiff {
+                key: "general_boot_order_network".to_string(),
+                expected: "Network".to_string(),
+                actual: "_missing_".to_string(),
             });
         }
 
@@ -1582,12 +1592,18 @@ impl Bmc {
         self.s.client.get(&url).await.map(|response| response.1)
     }
 
-    async fn is_general_boot_order_hard_disk_present(&self) -> Result<bool, RedfishError> {
+    async fn is_general_boot_order_option_present(&self, boot: Boot) -> Result<bool, RedfishError> {
+        let name = match boot {
+            Boot::Pxe => "Network",
+            Boot::HardDisk => "Hard Disk",
+            Boot::UefiHttp => {
+                return Err(RedfishError::NotSupported(
+                    "No Lenovo general boot order entry for UefiHttp".to_string(),
+                ))
+            }
+        };
         match self.get_general_boot_order().await {
-            Ok(boot_order) => Ok(boot_order
-                .boot_order_next
-                .iter()
-                .any(|option| option == GENERAL_BOOT_ORDER_HARD_DISK)),
+            Ok(boot_order) => Ok(boot_order.boot_order_next.iter().any(|o| o == name)),
             Err(RedfishError::HTTPErrorCode {
                 status_code: StatusCode::NOT_FOUND,
                 ..
@@ -1596,24 +1612,36 @@ impl Bmc {
         }
     }
 
-    async fn enable_hard_disk_in_general_boot_order(&self) -> Result<(), RedfishError> {
+    async fn set_general_boot_order(
+        &self,
+        boot_order_next: Vec<String>,
+    ) -> Result<(), RedfishError> {
+        let url = format!("{}/BootOrder.BootOrder", self.get_boot_settings_uri());
+        let body = HashMap::from([("BootOrderNext", boot_order_next)]);
+        self.s.client.patch(&url, body).await.map(|_status_code| ())
+    }
+
+    async fn ensure_in_general_boot_order(&self, boot: Boot) -> Result<(), RedfishError> {
+        let (name, insert_at) = match boot {
+            Boot::Pxe => ("Network", 0),
+            Boot::HardDisk => ("Hard Disk", 1),
+            Boot::UefiHttp => {
+                return Err(RedfishError::NotSupported(
+                    "No Lenovo general boot order entry for UefiHttp".to_string(),
+                ))
+            }
+        };
         let mut boot_order = self.get_general_boot_order().await?;
-        if boot_order
-            .boot_order_next
-            .iter()
-            .any(|option| option == GENERAL_BOOT_ORDER_HARD_DISK)
-        {
+        if boot_order.boot_order_next.iter().any(|o| o == name) {
             return Ok(());
         }
 
-        let insert_at = boot_order.boot_order_next.len().min(1);
+        let insert_at = insert_at.min(boot_order.boot_order_next.len());
         boot_order
             .boot_order_next
-            .insert(insert_at, GENERAL_BOOT_ORDER_HARD_DISK.to_string());
-
-        let url = format!("{}/BootOrder.BootOrder", self.get_boot_settings_uri());
-        let body = HashMap::from([("BootOrderNext", boot_order.boot_order_next)]);
-        self.s.client.patch(&url, body).await.map(|_status_code| ())
+            .insert(insert_at, name.to_string());
+        self.set_general_boot_order(boot_order.boot_order_next)
+            .await
     }
 
     async fn get_network_boot_order(&self) -> Result<LenovoBootOrder, RedfishError> {
@@ -1642,22 +1670,21 @@ impl Bmc {
     /// network boot order, because the network boot options list is empty
     /// when "Network" is not already present in the general boot order.
     async fn set_general_boot_order_network_first(&self) -> Result<(), RedfishError> {
+        let name = "Network";
         let mut boot_order = self.get_general_boot_order().await?;
-        const NETWORK: &str = "Network";
 
-        if let Some(pos) = boot_order.boot_order_next.iter().position(|s| s == NETWORK) {
+        if let Some(pos) = boot_order.boot_order_next.iter().position(|s| s == name) {
             if pos == 0 {
                 tracing::info!("NO-OP: Network is already the first general boot option");
                 return Ok(());
             }
             boot_order.boot_order_next.swap(0, pos);
         } else {
-            boot_order.boot_order_next.insert(0, NETWORK.to_string());
+            boot_order.boot_order_next.insert(0, name.to_string());
         }
 
-        let url = format!("{}/BootOrder.BootOrder", self.get_boot_settings_uri());
-        let body = HashMap::from([("BootOrderNext", boot_order.boot_order_next)]);
-        self.s.client.patch(&url, body).await.map(|_status_code| ())
+        self.set_general_boot_order(boot_order.boot_order_next)
+            .await
     }
 
     async fn get_expected_and_actual_first_boot_option(
