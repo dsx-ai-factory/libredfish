@@ -200,7 +200,6 @@ impl Bmc {
     async fn lockdown_status_lenovo_ami(&self) -> Result<Status, RedfishError> {
         const LOCKDOWN_FIELDS: &[&str] = &[
             "LockoutHostControl",
-            "LockoutBiosVariableWriteMode",
             "LockdownBiosSettingsChange",
             "LockdownBiosUpgradeDowngrade",
         ];
@@ -386,8 +385,8 @@ impl Redfish for Bmc {
 
     /// AMI lockdown - controls KCS access, USB support, and Host Interface.
     /// On LenovoAMI, uses the OEM ConfigBMC endpoint to control host lockout,
-    /// BIOS variable write, BIOS settings change, and BIOS upgrade/downgrade,
-    /// together with the host interface.
+    /// BIOS settings change and BIOS upgrade/downgrade, together with the
+    /// host interface. Full lockdown does not manage runtime EFI variable protection.
     fn lockdown<'a>(
         &'a self,
         target: EnabledDisabled,
@@ -401,7 +400,6 @@ impl Redfish for Bmc {
                 };
                 let body = HashMap::from([
                     ("LockoutHostControl", value),
-                    ("LockoutBiosVariableWriteMode", value),
                     ("LockdownBiosSettingsChange", value),
                     ("LockdownBiosUpgradeDowngrade", value),
                 ]);
