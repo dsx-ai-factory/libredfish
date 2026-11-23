@@ -53,6 +53,10 @@ const MGX_C2_PROCESSOR_MODULE_PART_NUMBER_FRAGMENT: &str = "2G535";
 /// Minimum BMC firmware version that exposes `IPMIHostInterface` on
 /// `Systems/{id}` for MGX C2 systems.
 const MIN_BMC_FW_IPMI_HOST_IFACE: &str = "01.05.01";
+
+/// Supermicro models that cannot PXE boot if the Redfish HostInterface is
+/// disabled during lockdown.
+const HOST_INTERFACE_LOCKDOWN_EXEMPT_MODELS: [&str; 2] = ["ARS-121L-DNR", "ARS-221GL-FNB-NC24B"];
 const HARD_DISK: &str = "UEFI Hard Disk";
 const NETWORK: &str = "UEFI Network";
 
@@ -401,8 +405,8 @@ impl Redfish for Bmc {
             use EnabledDisabled::*;
             match target {
                 Enabled => {
-                    // ARS-121L-DNR can't PXE boot if the host interface is disabled.
-                    if !self.is_ars_121l_dnr().await? {
+                    // Some models can't PXE boot if the host interface is disabled.
+                    if !self.must_keep_host_interface_enabled().await? {
                         self.set_host_interfaces(Disabled).await?;
                     }
                     self.set_kcs_privilege(supermicro::Privilege::Callback)
@@ -428,7 +432,7 @@ impl Redfish for Bmc {
             let is_syslockdown = self.get_syslockdown().await?;
             let message = format!("SysLockdownEnabled={is_syslockdown}, kcs_privilege={kcs_privilege:#?}, host_interface_enabled={is_hi_on}");
 
-            let must_keep_host_interface_enabled = self.is_ars_121l_dnr().await?;
+            let must_keep_host_interface_enabled = self.must_keep_host_interface_enabled().await?;
             let kcs_locked =
                 kcs_privilege.is_none() || kcs_privilege == Some(supermicro::Privilege::Callback);
             let kcs_unlocked = kcs_privilege.is_none()
@@ -1348,14 +1352,13 @@ impl Bmc {
         Ok(chassis.members.iter().any(is_mgx_c2_processor_module))
     }
 
-    async fn is_ars_121l_dnr(&self) -> Result<bool, RedfishError> {
-        Ok(self
-            .s
-            .get_system()
-            .await?
-            .model
-            .unwrap_or_default()
-            .contains("ARS-121L-DNR"))
+    async fn must_keep_host_interface_enabled(&self) -> Result<bool, RedfishError> {
+        let model = self.s.get_system().await?.model;
+        Ok(model.as_deref().is_some_and(|model| {
+            HOST_INTERFACE_LOCKDOWN_EXEMPT_MODELS
+                .iter()
+                .any(|exempt| model.contains(exempt))
+        }))
     }
 }
 
