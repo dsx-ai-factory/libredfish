@@ -37,7 +37,50 @@ pub struct Job {
     pub id: Option<String>,
     pub name: Option<String>,
     pub percent_complete: Option<u32>,
-    pub job_state: Option<TaskState>,
+    pub job_state: Option<JobState>,
+}
+
+/// https://redfish.dmtf.org/schemas/v1/Job.v1_3_0.yaml
+///
+/// `Unknown` is not a Redfish value. It catches states outside the schema.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    New,
+    Starting,
+    Running,
+    Suspended,
+    Interrupted,
+    Pending,
+    Stopping,
+    Completed,
+    Cancelled,
+    Exception,
+    Service,
+    UserIntervention,
+    Continue,
+    Validating,
+    Invalid,
+    #[serde(other)]
+    Unknown,
+}
+
+impl JobState {
+    pub fn as_task_state(self) -> Option<TaskState> {
+        Some(match self {
+            JobState::New => TaskState::New,
+            JobState::Starting => TaskState::Starting,
+            JobState::Running | JobState::Continue | JobState::Validating => TaskState::Running,
+            JobState::Suspended | JobState::UserIntervention => TaskState::Suspended,
+            JobState::Interrupted => TaskState::Interrupted,
+            JobState::Pending => TaskState::Pending,
+            JobState::Stopping => TaskState::Stopping,
+            JobState::Completed => TaskState::Completed,
+            JobState::Cancelled => TaskState::Cancelled,
+            JobState::Exception | JobState::Invalid => TaskState::Exception,
+            JobState::Service => TaskState::Service,
+            JobState::Unknown => return None,
+        })
+    }
 }
 
 impl Job {
@@ -47,7 +90,7 @@ impl Job {
             id: self.id.clone().unwrap_or("".to_string()),
             messages: vec![],
             name: self.name.clone(),
-            task_state: self.job_state.clone(),
+            task_state: self.job_state.and_then(JobState::as_task_state),
             task_status: None,
             task_monitor: None,
             percent_complete: self.percent_complete,
