@@ -1,0 +1,18 @@
+{
+    "@odata.id": "/redfish/v1/TaskService/Tasks/xcc3",
+    "@odata.type": "#Task.v1_4_3.Task",
+    "Id": "xcc3",
+    "Name": "Task xcc3",
+    "TaskState": "Completed",
+    "TaskStatus": "OK",
+    "PercentComplete": 100,
+    "Messages": [
+        {
+            "MessageId": "Update.1.0.1.OperationTransitionedToJob",
+            "Message": "The update operation has transitioned to the job at URI '/redfish/v1/JobService/Jobs/FW_Update_2'.",
+            "MessageArgs": ["/redfish/v1/JobService/Jobs/FW_Update_2"],
+            "Severity": "OK",
+            "Resolution": "Follow the referenced job and monitor the job for further updates."
+        }
+    ]
+}
