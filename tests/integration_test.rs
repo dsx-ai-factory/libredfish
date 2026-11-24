@@ -54,6 +54,7 @@ const PYTHON_VENV_DIR: &str = "libredfish-python-venv";
 // Ports we hope are not in use
 const GENERIC_PORT: &str = "8732";
 const TASK_CANCELLATION_PORT: &str = "8746";
+const TASK_TRANSITIONED_JOB_PORT: &str = "8748";
 const DELL_PORT: &str = "8733";
 const HPE_PORT: &str = "8734";
 const LENOVO_PORT: &str = "8735";
@@ -197,6 +198,38 @@ async fn test_task_cancellation() -> anyhow::Result<()> {
                 Err(libredfish::RedfishError::InvalidValue { .. })
             ),
             "expected invalid task identifier: {task_id:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_task_transitioned_to_job() -> anyhow::Result<()> {
+    let _server = run_mockup_server("task_transitioned_job", TASK_TRANSITIONED_JOB_PORT)?;
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let client = pool.create_standard_client(libredfish::Endpoint {
+        host: "127.0.0.1".to_string(),
+        port: Some(TASK_TRANSITIONED_JOB_PORT.parse()?),
+        ..Default::default()
+    })?;
+    for (task_id, expected_id, expected_state, expected_percent) in [
+        ("xcc2", "JobR000001-Update", "Running", 40),
+        ("xcc3", "FW_Update_2", "Running", 90),
+        ("no_job", "no_job", "Completed", 100),
+    ] {
+        let task = client.get_task(task_id).await?;
+        assert_eq!(task.id, expected_id, "task {task_id}");
+        assert_eq!(
+            task.task_state.map(|state| state.to_string()).as_deref(),
+            Some(expected_state),
+            "task {task_id}"
+        );
+        assert_eq!(
+            task.percent_complete,
+            Some(expected_percent),
+            "task {task_id}"
         );
     }
     Ok(())
