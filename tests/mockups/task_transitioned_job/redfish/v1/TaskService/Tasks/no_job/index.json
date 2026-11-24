@@ -1,0 +1,18 @@
+{
+    "@odata.id": "/redfish/v1/TaskService/Tasks/no_job",
+    "@odata.type": "#Task.v1_4_3.Task",
+    "Id": "no_job",
+    "Name": "Task no_job",
+    "TaskState": "Completed",
+    "TaskStatus": "OK",
+    "PercentComplete": 100,
+    "Messages": [
+        {
+            "MessageId": "TaskEvent.1.0.3.TaskCompletedOK",
+            "Message": "The task with Id 'no_job' has completed.",
+            "MessageArgs": ["no_job"],
+            "Severity": "OK",
+            "Resolution": "None."
+        }
+    ]
+}

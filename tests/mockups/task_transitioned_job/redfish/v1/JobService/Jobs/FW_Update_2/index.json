@@ -1,0 +1,9 @@
+{
+    "@odata.id": "/redfish/v1/JobService/Jobs/FW_Update_2",
+    "@odata.type": "#Job.v1_2_1.Job",
+    "Id": "FW_Update_2",
+    "Name": "FW_Update_2",
+    "JobState": "Running",
+    "JobStatus": "OK",
+    "PercentComplete": 90
+}

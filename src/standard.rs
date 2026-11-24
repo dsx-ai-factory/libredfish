@@ -611,11 +611,11 @@ impl Redfish for RedfishStandard {
             let url = format!("TaskService/Tasks/{}", id);
             let (_status_code, body) = self.client.get::<Task>(&url).await?;
 
-            if let Some(msg) = body
-                .messages
-                .iter()
-                .find(|x| x.message_id == "Update.1.0.OperationTransitionedToJob")
-            {
+            // The registry version varies: XCC2 sends Update.1.0, XCC3 Update.1.0.1.
+            if let Some(msg) = body.messages.iter().find(|x| {
+                x.message_id.starts_with("Update.")
+                    && x.message_id.ends_with(".OperationTransitionedToJob")
+            }) {
                 if let Some(message_arg) = msg.message_args.first() {
                     // The task is redirecting us to a JobService.  Look at that instead, and make a fake task from it.
                     let (_, job): (_, Job) = self
