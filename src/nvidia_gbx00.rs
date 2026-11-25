@@ -129,6 +129,21 @@ impl Display for BootOptionMatchField {
     }
 }
 
+/// The boot order is in place only when the expected HTTP boot option is first and not disabled.
+/// Firmware skips a disabled option, so moving it to the front of `BootOrder` alone has no effect.
+/// A missing `BootOptionEnabled` is treated as enabled.
+fn boot_order_has_expected_first(
+    expected: Option<&BootOption>,
+    actual: Option<&BootOption>,
+) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    expected.boot_option_enabled != Some(false)
+        && actual
+            .is_some_and(|actual| actual.boot_option_reference == expected.boot_option_reference)
+}
+
 fn matches_http_ipv4_boot_option(option: &BootOption, boot_interface_mac: &str) -> bool {
     let mac = boot_interface_mac.replace([':', '-'], "");
     if mac.len() != 12 || !mac.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -933,9 +948,20 @@ impl Redfish for Bmc {
         Box::pin(async move {
             let mac = crate::resolve_boot_interface_mac(self, boot_interface).await?;
             let (expected, actual) = self.get_expected_and_actual_first_boot_option(&mac).await?;
-            Ok(expected.is_some()
-                && expected.as_ref().map(|b| &b.boot_option_reference)
-                    == actual.as_ref().map(|b| &b.boot_option_reference))
+            if let Some(option) = expected
+                .as_ref()
+                .filter(|option| option.boot_option_enabled == Some(false))
+            {
+                tracing::warn!(
+                    boot_option = %option.id,
+                    boot_interface_mac = %mac,
+                    "HTTP boot option for the boot interface is disabled; enable it in firmware setup"
+                );
+            }
+            Ok(boot_order_has_expected_first(
+                expected.as_ref(),
+                actual.as_ref(),
+            ))
         })
     }
 
@@ -1258,6 +1284,45 @@ mod tests {
             "UefiDevicePath": path,
         }))
         .unwrap()
+    }
+
+    fn boot_option_ref(reference: &str, enabled: Option<bool>) -> BootOption {
+        serde_json::from_value(serde_json::json!({
+            "@odata.id": format!("/redfish/v1/Systems/System_0/BootOptions/{reference}"),
+            "@odata.type": "#BootOption.v1_0_4.BootOption",
+            "Id": reference,
+            "Name": reference,
+            "BootOptionReference": reference,
+            "BootOptionEnabled": enabled,
+            "DisplayName": NEW_HTTP_NAME,
+            "UefiDevicePath": HTTP_PATH,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn boot_order_check_requires_expected_option_first_and_not_disabled() {
+        let enabled = boot_option_ref("Boot0022", Some(true));
+        let unreported = boot_option_ref("Boot0022", None);
+        let disabled = boot_option_ref("Boot0022", Some(false));
+        let other = boot_option_ref("Boot001F", Some(true));
+
+        assert!(boot_order_has_expected_first(
+            Some(&enabled),
+            Some(&enabled)
+        ));
+        assert!(boot_order_has_expected_first(
+            Some(&unreported),
+            Some(&unreported)
+        ));
+        // First in BootOrder but disabled: firmware skips it.
+        assert!(!boot_order_has_expected_first(
+            Some(&disabled),
+            Some(&disabled)
+        ));
+        assert!(!boot_order_has_expected_first(Some(&enabled), Some(&other)));
+        assert!(!boot_order_has_expected_first(None, Some(&other)));
+        assert!(!boot_order_has_expected_first(Some(&enabled), None));
     }
 
     #[test]
