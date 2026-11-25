@@ -3,6 +3,7 @@
     "Boot": {
         "BootOrder": [
             "Boot0003",
+            "Boot0001",
             "Boot0002"
         ]
     },
