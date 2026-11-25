@@ -19,6 +19,8 @@ use crate::{
 const RESET_REQUEST: &str = "POST /redfish/v1/Systems/1/Actions/ComputerSystem.Reset HTTP/1.1";
 const GET_REQUEST: &str = "GET /redfish/v1/Systems/1/ HTTP/1.1";
 const DELETE_REQUEST: &str = "DELETE /redfish/v1/AccountService/Accounts/test HTTP/1.1";
+const ACCOUNTS_REQUEST: &str =
+    "GET /redfish/v1/AccountService/Accounts?$expand=.($levels=1) HTTP/1.1";
 
 struct Server {
     port: u16,
@@ -56,11 +58,25 @@ async fn client(system: Value, status: u16) -> (RedfishStandard, Server) {
     client_with_transport(system, status, pool(), None).await
 }
 
+async fn client_with_transport(
+    system: Value,
+    status: u16,
+    pool: RedfishClientPool,
+    truncate_response_to: Option<&'static str>,
+) -> (RedfishStandard, Server) {
+    serve(system, status, None, pool, truncate_response_to).await
+}
+
+async fn accounts_client(status: u16, accounts: Value) -> (RedfishStandard, Server) {
+    serve(json!({"Id": "1"}), status, Some(accounts), pool(), None).await
+}
+
 // Record every complete request and accept the expected writes. The selected
 // fault loses part of the first matching response after its request is recorded.
-async fn client_with_transport(
+async fn serve(
     mut system: Value,
     status: u16,
+    accounts: Option<Value>,
     pool: RedfishClientPool,
     truncate_response_to: Option<&'static str>,
 ) -> (RedfishStandard, Server) {
@@ -160,6 +176,8 @@ async fn client_with_transport(
                     )
                 } else if first == GET_REQUEST {
                     (status, system.to_string())
+                } else if let (ACCOUNTS_REQUEST, Some(accounts)) = (first.as_str(), &accounts) {
+                    (status, accounts.to_string())
                 } else if first == "PATCH /redfish/v1/Chassis/SMM_0 HTTP/1.1" {
                     (204, String::new())
                 } else if first == RESET_REQUEST || first == DELETE_REQUEST {
@@ -390,4 +408,66 @@ async fn vera_rubin_explicit_on_allows_nic_patch() {
             json!({"Oem": {"Nvidia": {"HostManagementNetworkAccess": target.is_enabled()}}})
         );
     }
+}
+
+/// Credential checks read the account collection, so a rejected or unreadable
+/// response must not look like an empty account list.
+#[tokio::test]
+async fn get_accounts_propagates_http_and_decode_failures() {
+    for status in [401, 403, 500] {
+        let (standard, server) = accounts_client(status, json!({})).await;
+        let result = standard.get_accounts().await;
+        assert!(
+            matches!(&result, Err(RedfishError::HTTPErrorCode { status_code, .. })
+                if status_code.as_u16() == status),
+            "status {status}: expected an HTTP error, got {result:?}"
+        );
+        assert_eq!(server.requests.lock().unwrap()[0].0, ACCOUNTS_REQUEST);
+    }
+
+    let (standard, _server) = accounts_client(
+        200,
+        json!({
+            "@odata.id": "/redfish/v1/AccountService/Accounts/1",
+            "@odata.type": "#ManagerAccount.v1_10_0.ManagerAccount",
+        }),
+    )
+    .await;
+    let result = standard.get_accounts().await;
+    assert!(
+        matches!(&result, Err(RedfishError::TypeMismatch { .. })),
+        "expected a decode failure, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_accounts_returns_members_sorted_by_id() {
+    let account = |id: &str, username: &str| {
+        json!({
+            "@odata.id": format!("/redfish/v1/AccountService/Accounts/{id}"),
+            "@odata.type": "#ManagerAccount.v1_10_0.ManagerAccount",
+            "Id": id,
+            "UserName": username,
+            "RoleId": "Administrator",
+        })
+    };
+    let (standard, _server) = accounts_client(
+        200,
+        json!({
+            "@odata.id": "/redfish/v1/AccountService/Accounts",
+            "@odata.type": "#ManagerAccountCollection.ManagerAccountCollection",
+            "Name": "Accounts Collection",
+            "Members@odata.count": 2,
+            "Members": [account("2", "operator"), account("1", "root")],
+        }),
+    )
+    .await;
+    let usernames: Vec<_> = standard
+        .get_accounts()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|account| account.username)
+        .collect();
+    assert_eq!(usernames, ["root", "operator"]);
 }

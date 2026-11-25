@@ -189,15 +189,13 @@ impl Redfish for RedfishStandard {
         &'a self,
     ) -> crate::RedfishFuture<'a, Result<Vec<ManagerAccount>, RedfishError>> {
         Box::pin(async move {
-            let mut accounts: Vec<ManagerAccount> = self
+            let mut accounts = self
                 .get_collection(ODataId {
                     odata_id: "/redfish/v1/AccountService/Accounts".into(),
                 })
-                .await
-                .and_then(|c| c.try_get::<ManagerAccount>())
-                .into_iter()
-                .flat_map(|rc| rc.members)
-                .collect();
+                .await?
+                .try_get::<ManagerAccount>()?
+                .members;
 
             accounts.sort();
             Ok(accounts)
